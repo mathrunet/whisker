@@ -19,8 +19,13 @@ include = [
     "Cargo.toml",
     "Package.swift",
     "build.gradle.kts",
-    "src/lib.rs",
+    "src/**",
+    "desktop/Cargo.toml",
+    "desktop/src/**",
+    "web/Cargo.toml",
+    "web/src/**",
     "android/**/*.kt",
+    "android/src/androidTest/AndroidManifest.xml",
     "ios/**/*.swift",
     "README.md",
 ]
@@ -39,3 +44,5 @@ desktop = { manifest = "desktop/Cargo.toml" }
 whisker = { path = "../../crates/whisker", version = "0.16.0" }
 # Event payloads cross as JSON bodies; `bind_typed` deserialises them.
 serde = { workspace = true, features = ["derive"] }
+
+serde_json.workspace = true
