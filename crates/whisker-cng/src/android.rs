@@ -763,7 +763,7 @@ mod tests {
             extra_gradle_plugins: Vec::new(),
             extra_gradle_dependencies: Vec::new(),
             extra_files: BTreeMap::new(),
-            template_version: 39,
+            template_version: 40,
             cargo_selection: crate::CargoSelection::default(),
         }
     }
