@@ -13,6 +13,8 @@ use whisker_desktop::{
     ModuleDefinition, WhiskerModule, WhiskerValue,
 };
 
+mod managed;
+
 const MODULE_NAME: &str = "whisker-image:Image";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +61,7 @@ struct ImageDesktopView {
     events: DesktopEventEmitter,
     src: String,
     headers: String,
+    options: String,
 }
 
 impl ImageDesktopView {
@@ -68,6 +71,7 @@ impl ImageDesktopView {
             events,
             src: String::new(),
             headers: String::new(),
+            options: String::new(),
         }
     }
 
@@ -83,6 +87,14 @@ impl ImageDesktopView {
         if !self.src.is_empty() {
             self.reload();
         }
+    }
+
+    fn set_cache(&mut self, value: &str) {
+        if self.options == value {
+            return;
+        }
+        self.options = value.to_owned();
+        self.reload();
     }
 
     fn set_mode(&mut self, value: &str) {
@@ -106,46 +118,60 @@ impl ImageDesktopView {
             state.generation = state.generation.wrapping_add(1);
             state.request
         };
-        if self.src.is_empty() {
+        if self.src.is_empty() && self.options.is_empty() {
             return;
         }
         let src = self.src.clone();
         let headers = self.headers.clone();
+        let options = self.options.clone();
         let state = Arc::clone(&self.state);
         let events = self.events.clone();
-        std::thread::Builder::new()
-            .name("whisker-image-loader".into())
-            .spawn(move || {
-                let result = load_image(&src, &headers);
-                let event = {
-                    let mut state = state.lock().expect("Image state lock poisoned");
-                    if state.request != request {
-                        return;
-                    }
-                    state.generation = state.generation.wrapping_add(1);
-                    state.cache = None;
-                    match result {
-                        Ok(image) => {
-                            let width = image.width();
-                            let height = image.height();
-                            state.decoded = Some(image);
-                            DesktopNativeEvent {
-                                event: "load".into(),
-                                detail: image_detail(width as f64, height as f64, ""),
-                            }
-                        }
-                        Err(error) => {
-                            state.decoded = None;
-                            DesktopNativeEvent {
-                                event: "error".into(),
-                                detail: image_detail(0.0, 0.0, &error),
-                            }
+        let is_managed = !options.is_empty();
+        let job = move || {
+            if state.lock().expect("Image state lock poisoned").request != request {
+                return;
+            }
+            let result = if options.is_empty() {
+                load_image(&src, &headers)
+            } else {
+                managed::load(&src, &headers, &options)
+            };
+            let event = {
+                let mut state = state.lock().expect("Image state lock poisoned");
+                if state.request != request {
+                    return;
+                }
+                state.generation = state.generation.wrapping_add(1);
+                state.cache = None;
+                match result {
+                    Ok(image) => {
+                        let width = image.width();
+                        let height = image.height();
+                        state.decoded = Some(image);
+                        DesktopNativeEvent {
+                            event: "load".into(),
+                            detail: image_detail(width as f64, height as f64, ""),
                         }
                     }
-                };
-                events.emit(event);
-            })
-            .expect("Desktop Host can spawn an image loader");
+                    Err(error) => {
+                        state.decoded = None;
+                        DesktopNativeEvent {
+                            event: "error".into(),
+                            detail: image_detail(0.0, 0.0, &error),
+                        }
+                    }
+                }
+            };
+            events.emit(event);
+        };
+        if is_managed {
+            managed::enqueue(job);
+        } else {
+            std::thread::Builder::new()
+                .name("whisker-image-loader".into())
+                .spawn(job)
+                .expect("Desktop Host can spawn an image loader");
+        }
     }
 
     fn rasterize(&self, width: u32, height: u32) -> Option<DesktopRaster> {
@@ -173,6 +199,13 @@ impl ImageDesktopView {
     }
 }
 
+impl Drop for ImageDesktopView {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().expect("Image state lock poisoned");
+        state.request = state.request.wrapping_add(1);
+    }
+}
+
 struct ImageModule;
 
 #[whisker_desktop::WhiskerModule]
@@ -196,6 +229,32 @@ impl WhiskerModule for ImageModule {
                         promise.resolve(WhiskerValue::Null);
                     })
                     .expect("Desktop Host can spawn an image prefetch worker");
+            })
+            .async_function("configureCache", |args, promise, _| {
+                let value = match args.first() {
+                    Some(WhiskerValue::String(value)) => value.clone(),
+                    _ => {
+                        promise.reject("expected byte limit string");
+                        return;
+                    }
+                };
+                managed::enqueue(move || match managed::configure(&value) {
+                    Ok(()) => promise.resolve(WhiskerValue::Null),
+                    Err(e) => promise.reject(e),
+                });
+            })
+            .async_function("removeCached", |args, promise, _| {
+                let value = match args.first() {
+                    Some(WhiskerValue::String(value)) => value.clone(),
+                    _ => {
+                        promise.reject("expected URL string");
+                        return;
+                    }
+                };
+                managed::enqueue(move || match managed::remove(&value) {
+                    Ok(()) => promise.resolve(WhiskerValue::Null),
+                    Err(e) => promise.reject(e),
+                });
             })
             .view(
                 DesktopViewDefinition::new(MODULE_NAME, ImageDesktopView::new)
@@ -228,6 +287,16 @@ impl WhiskerModule for ImageModule {
                             view.set_headers(value);
                         },
                         |view| view.set_headers(""),
+                    )
+                    .prop(
+                        "cache",
+                        |view, value| {
+                            let WhiskerValue::String(value) = value else {
+                                unreachable!("Host validates image cache options")
+                            };
+                            view.set_cache(value);
+                        },
+                        |view| view.set_cache(""),
                     )
                     .event("load")
                     .event("error")
@@ -384,6 +453,49 @@ mod tests {
     }
 
     #[test]
+    fn managed_view_loads_atomic_options_with_an_empty_source_attribute() {
+        let url = format!("https://example.com/managed-view-{}", std::process::id());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::new(8, 6))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        managed::seed(&url, &png.into_inner());
+        let mut view = ImageDesktopView::new(DesktopEventEmitter::default());
+        for width in [8, 4] {
+            view.set_cache(&serde_json::json!({"_src": url, "decode_width": width}).to_string());
+        }
+        view.set_src("");
+        let (send, receive) = std::sync::mpsc::channel();
+        managed::enqueue(move || {
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            view.state
+                .lock()
+                .unwrap()
+                .decoded
+                .as_ref()
+                .unwrap()
+                .dimensions(),
+            (4, 3)
+        );
+        assert!(view.rasterize(200, 150).is_some());
+        view.set_cache(&serde_json::json!({"_src": url, "decode_width": 0}).to_string());
+        let (send, receive) = std::sync::mpsc::channel();
+        managed::enqueue(move || {
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(view.state.lock().unwrap().decoded.is_none());
+        managed::remove(&url).unwrap();
+    }
+
+    #[test]
     fn file_loader_populates_the_shared_decode_cache() {
         let path =
             std::env::temp_dir().join(format!("whisker-image-desktop-{}.png", std::process::id()));
@@ -396,5 +508,41 @@ mod tests {
         assert_eq!(first.dimensions(), (2, 3));
         assert!(Arc::ptr_eq(&first, &second));
         std::fs::remove_file(path).ok();
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::managed::*;
+    use image::{Rgba, RgbaImage};
+    use std::sync::Arc;
+
+    #[test]
+    fn byte_budget_evicts_least_recently_used_and_can_shrink() {
+        let mut cache = MemoryCache::new(32);
+        let image = Arc::new(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255])));
+        cache.insert("a".into(), image.clone());
+        cache.insert("b".into(), image.clone());
+        assert!(cache.get("a").is_some());
+        cache.insert("c".into(), image.clone());
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("a").is_some());
+        assert_eq!(cache.bytes(), 32);
+        cache.set_limit(16);
+        assert!(cache.get("c").is_none());
+        cache.set_limit(0);
+        cache.insert("oversized".into(), image);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn decode_dimensions_preserve_aspect_and_never_upscale() {
+        assert_eq!(
+            decode_size(800, 600, Some(400), Some(400)).unwrap(),
+            (400, 300)
+        );
+        assert_eq!(decode_size(800, 600, None, Some(150)).unwrap(), (200, 150));
+        assert_eq!(decode_size(80, 60, Some(400), None).unwrap(), (80, 60));
+        assert!(decode_size(800, 600, Some(0), None).is_err());
     }
 }

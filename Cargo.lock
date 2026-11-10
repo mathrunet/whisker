@@ -7498,6 +7498,7 @@ name = "whisker-image"
 version = "0.14.4"
 dependencies = [
  "serde",
+ "serde_json",
  "whisker",
 ]
 
@@ -7508,7 +7509,9 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "lru 0.18.4",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ureq",
  "whisker-desktop",
 ]
@@ -7526,6 +7529,7 @@ dependencies = [
 name = "whisker-image-web"
 version = "0.14.4"
 dependencies = [
+ "serde_json",
  "web-sys",
  "whisker-web",
 ]

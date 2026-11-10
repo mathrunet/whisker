@@ -14,3 +14,6 @@ lru = "0.18.2"
 serde_json = { workspace = true }
 ureq = "2.12"
 whisker-desktop = { path = "../../../platforms/desktop", version = "0.16.0" }
+
+sha2 = "0.10"
+serde = { workspace = true, features = ["derive"] }
