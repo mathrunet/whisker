@@ -486,3 +486,11 @@ one, operations fail instead of falling back to shared temporary storage. Unix
 application data directories and files use owner-only 0700 and 0600 permissions,
 respectively. Existing values are retained at their existing per-user location.
 Local-store is plaintext storage; use secure-store for secrets.
+## WebView navigation origins
+
+Navigation patterns match parsed scheme, host and effective port, never URL
+query or path text. `https://*.example.com` permits subdomains on the default
+HTTPS port, excluding the apex; add a separate apex rule when needed. Explicit
+ports constrain the origin. The default broad `https://*` and `http://*` rules
+allow any valid host and port for their scheme. Empty or malformed lists reject
+navigation on both platforms, including initial and updated URL props.
