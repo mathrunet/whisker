@@ -422,3 +422,11 @@ clients require a configured session secret. Remote DNS names and cross-origin
 requests are rejected before static files or WebSocket handlers run. Native log
 and trace envelopes are ignored until authentication succeeds. Device log control
 characters are removed before either TUI or plain terminal output.
+## Release environment boundary
+
+Release archive and Gradle launch commands remove `WHISKER_FEATURES` from their
+environment. The generated Xcode script and the Gradle Rust build task also ignore
+and remove that variable for Release builds, including IDE builds using a reused
+Gradle daemon. Explicit application Cargo features remain application configuration;
+this boundary prevents the development CLI's environment injection from carrying
+hot-reload into release builds.
