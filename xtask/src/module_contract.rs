@@ -96,7 +96,8 @@ fn rust_host_module_names_are_package_qualified() {
                 .map(|name| format!("{package_name}:{name}")),
         );
 
-        for host in ["web", "desktop"] {
+        let mut checked_roots = std::collections::HashSet::new();
+        for host in ["web", "desktop", "linux", "windows"] {
             let Some(host_manifest) = platform_manifest(&manifest, host) else {
                 continue;
             };
@@ -105,15 +106,23 @@ fn rust_host_module_names_are_package_qualified() {
                 .parent()
                 .unwrap()
                 .to_path_buf();
+            if !checked_roots.insert(host_root.clone()) {
+                continue;
+            }
             let source = source_tree(&host_root.join("src"), "rs");
             let compact = compact_source(&source);
             let constant_names =
                 string_values_after(&source, "const MODULE_NAME: &str = \"").collect::<Vec<_>>();
             let direct_names = string_values_after(&compact, "ModuleDefinition::new().name(\"")
+                .chain(string_values_after(
+                    &compact,
+                    "ModuleDefinition::default().name(\"",
+                ))
                 .collect::<Vec<_>>();
             let names_module = !direct_names.is_empty()
                 || !constant_names.is_empty()
-                    && compact.contains("ModuleDefinition::new().name(MODULE_NAME)");
+                    && (compact.contains("ModuleDefinition::new().name(MODULE_NAME)")
+                        || compact.contains("ModuleDefinition::default().name(MODULE_NAME)"));
             if source.contains("impl WhiskerModule") && !names_module {
                 failures.push(format!(
                     "{package_name}: {host} WhiskerModule has no ModuleDefinition name"

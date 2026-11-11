@@ -19,7 +19,7 @@ use whisker_style::StyleEnvironment;
 use crate::node::NodeWidget;
 use crate::scene::{GtkFrameSink, SharedScrollFeedback, max_scroll_offset};
 use crate::text::PangoMeasurementProvider;
-use crate::{LinuxAppConfig, LinuxError};
+use crate::{LinuxAppConfig, LinuxError, LinuxModuleDefinition};
 
 thread_local! {
     static APPLICATION: RefCell<Option<LinuxApplication>> = const { RefCell::new(None) };
@@ -115,7 +115,7 @@ fn activate(
         .child(&surface)
         .build();
 
-    let host = LinuxApplication::new(surface.clone())?;
+    let host = LinuxApplication::new(surface.clone(), &config.modules)?;
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(host));
     SURFACE.with(|slot| *slot.borrow_mut() = Some(surface.clone()));
     with_application(|host| {
@@ -155,9 +155,12 @@ struct LinuxApplication {
 }
 
 impl LinuxApplication {
-    fn new(surface: NodeWidget) -> Result<Self, LinuxError> {
-        let modules = RustModuleRuntime::new([], request_frame)
-            .map_err(|error| LinuxError(format!("bind GTK modules: {error}")))?;
+    fn new(surface: NodeWidget, definitions: &[LinuxModuleDefinition]) -> Result<Self, LinuxError> {
+        let modules = RustModuleRuntime::new(
+            definitions.iter().map(|module| module.service.clone()),
+            request_frame,
+        )
+        .map_err(|error| LinuxError(format!("bind GTK modules: {error}")))?;
         let elements = ElementRegistry::standard_with_linked_providers()
             .map_err(|error| LinuxError(format!("build element registry: {error}")))?;
         let capabilities = host_capabilities()
@@ -172,7 +175,12 @@ impl LinuxApplication {
             capabilities.protocol(),
         );
         let wake = RuntimeWakeHandle::new(|| glib::MainContext::default().invoke(request_frame));
-        let measurements = PangoMeasurementProvider::new(crate::text::new_context());
+        let views = definitions
+            .iter()
+            .flat_map(|module| module.views.iter().cloned())
+            .collect::<Vec<_>>();
+        let measurements = PangoMeasurementProvider::new(crate::text::new_context())
+            .with_view_measurements(elements.registrations(), &views);
         let frames = GtkFrameSink::new(
             surface.clone(),
             surface_id,
@@ -180,6 +188,7 @@ impl LinuxApplication {
             capabilities,
             measurements.prepared(),
             measurements.context().clone(),
+            views,
         );
         Ok(Self {
             feedback: frames.feedback(),

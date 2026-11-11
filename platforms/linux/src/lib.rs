@@ -9,11 +9,15 @@
 use std::error::Error;
 use std::fmt;
 
-use whisker::Element;
+use whisker::{Element, ElementModuleDefinition};
+
+pub use gtk4;
+pub use module::{LinuxEventEmitter, LinuxModuleDefinition, LinuxView, LinuxViewDefinition};
 
 mod app;
 mod color;
 mod cursor;
+mod module;
 mod node;
 mod paint;
 mod scene;
@@ -30,6 +34,7 @@ pub struct LinuxAppConfig {
     width: i32,
     height: i32,
     background_rgb: [u8; 3],
+    modules: Vec<LinuxModuleDefinition>,
 }
 
 impl LinuxAppConfig {
@@ -40,12 +45,23 @@ impl LinuxAppConfig {
             width: 1024,
             height: 720,
             background_rgb: [255, 255, 255],
+            modules: Vec::new(),
         }
     }
 
     /// Sets the window background shown behind Whisker content.
     pub fn with_background_rgb(mut self, red: u8, green: u8, blue: u8) -> Self {
         self.background_rgb = [red, green, blue];
+        self
+    }
+
+    /// Installs one module's element schema and Host implementation.
+    pub fn with_module(
+        mut self,
+        _elements: ElementModuleDefinition,
+        host: impl Into<LinuxModuleDefinition>,
+    ) -> Self {
+        self.modules.push(host.into());
         self
     }
 }
