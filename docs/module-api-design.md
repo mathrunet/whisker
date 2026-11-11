@@ -494,3 +494,11 @@ HTTPS port, excluding the apex; add a separate apex rule when needed. Explicit
 ports constrain the origin. The default broad `https://*` and `http://*` rules
 allow any valid host and port for their scheme. Empty or malformed lists reject
 navigation on both platforms, including initial and updated URL props.
+## WebView bridge trust
+
+`message_origins` is an explicit set of exact HTTP(S) origins for incoming
+main-frame messages. It defaults to empty (no incoming messages), independently
+of navigation's origin whitelist. Configure it alongside `on_message`. Iframes,
+opaque origins, wildcard origins and unsupported Android WebMessageListener
+implementations cannot send native bridge events. Native callback metadata, not
+JavaScript-supplied origin strings, determines the sender.
