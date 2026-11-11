@@ -511,3 +511,9 @@ encoded path, and preserves any fixed callback query parameters. It does not inf
 authenticity from URL matching: the authentication caller must validate a fresh
 state value and complete PKCE verification before accepting an authorization code.
 Custom schemes may be invoked by any app, even when correctly registered.
+## System-browser URL policy
+
+Web and desktop system-browser handoff and Android Custom Tabs accept only
+absolute HTTP(S) URLs. The Android ACTION_VIEW fallback applies the same policy.
+Authentication start URLs follow this policy; application callback schemes are
+validated separately and are not system-browser launch URLs.
