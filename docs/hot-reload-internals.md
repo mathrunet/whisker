@@ -413,3 +413,12 @@ CLI and runtime must be rebuilt together after protocol updates. HMAC authentica
 but does not encrypt the connection. The OS debug transport and provisioned secret
 are trusted; reading the Android debug property compromises that session. OS
 randomness failure disables authenticated development transport.
+## Browser development request boundary
+
+The dev server accepts only its bound address and port (plus localhost for a
+loopback or wildcard bind) in Host. Explicit Origin headers must match the same
+HTTP authority. Browser WebSocket upgrades require that Origin; originless native
+clients require a configured session secret. Remote DNS names and cross-origin
+requests are rejected before static files or WebSocket handlers run. Native log
+and trace envelopes are ignored until authentication succeeds. Device log control
+characters are removed before either TUI or plain terminal output.
