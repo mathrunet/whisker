@@ -117,7 +117,7 @@ the unified workflow through `workflow_call`.
 The source pins are `WHISKER_SDK_VERSION` and
 `WHISKER_GRADLE_PLUGIN_VERSION` in `crates/whisker-cng/src/generator.rs`, and
 `WHISKER_IOS_SPM_VERSION` in `crates/whisker-cng/src/ios_modules.rs` plus
-`packages/*/Package.swift`, and `WHISKER_WINDOWS_HOST_VERSION` in
+`packages/**/Package.swift`, and `WHISKER_WINDOWS_HOST_VERSION` in
 `platforms/windows/build.rs` (`0.0.0` until the first package is published, which
 makes `windows_version` required). The preparation command keeps these consistent.
 
@@ -130,6 +130,9 @@ gh run rerun <run-id> --failed
 ```
 
 The checkout must remain the same commit. Native tags reject another commit.
+A re-run keeps the failed run's job definitions; when the Rust publish job
+itself needs a workflow fix, merge the fix and dispatch `release-resume` with
+the release-plan merge commit.
 Changes to packaged Rust content or Cargo.lock after preparation are rejected
 before publishing. Re-prepare the release if main acquired those changes.
 Maven publication receipts prevent overwriting a successful upload when
