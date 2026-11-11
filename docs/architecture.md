@@ -355,3 +355,8 @@ manifest overlay enables development connections; release variants do not includ
 that overlay. Applications that require production HTTP must explicitly configure
 their Android network policy. Verify the final merged manifest when using plugins
 that supply network security configuration or application-attribute overrides.
+## Gradle wrapper integrity
+
+The generated wrapper pins `distributionSha256Sum` to Gradle's official checksum
+for the selected binary ZIP. Update the URL and checksum together when deliberately
+changing Gradle versions. The wrapper verifies downloaded distributions before use.
