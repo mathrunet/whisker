@@ -517,3 +517,9 @@ Web and desktop system-browser handoff and Android Custom Tabs accept only
 absolute HTTP(S) URLs. The Android ACTION_VIEW fallback applies the same policy.
 Authentication start URLs follow this policy; application callback schemes are
 validated separately and are not system-browser launch URLs.
+## Secure-store key namespace
+
+Android reserves `__whisker_secure_keyset__` for its encrypted Tink keyset.
+Loading, saving or removing that key as application data fails before accessing
+the cryptographic state. Existing application keys and encrypted values are kept
+in place; no key migration or keyset rotation is performed.
