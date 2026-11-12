@@ -10,8 +10,10 @@
 //! - **Android**: `ImageView` + [Coil](https://coil-kt.github.io/coil/)
 //!   for URL fetching, `LruCache`, and disk cache.
 //! - **Web**: a native `<img>` element and the browser HTTP cache.
-//! - **Desktop**: background URL/file decoding into a GPU-uploaded raster,
-//!   backed by a shared bounded decoded-image cache.
+//! - **macOS**: `NSImageView` + Kingfisher, sharing the iOS sources.
+//! - **Linux**: background decoding through the `loader` module, backed by a shared
+//!   bounded decoded-image cache.
+//! - **Windows**: WinHTTP fetching, WIC decoding, and Direct2D drawing.
 //!
 //! URL loading and caching live in this module rather than the renderer
 //! kernel, keeping the built-in Host surface small and making image policy
@@ -43,8 +45,8 @@
 //!   defaults to [`ImageMode::AspectFill`].
 //! - `headers` — extra request headers for remote sources, as a JSON
 //!   object. Hot-link protection is what this is for: those hosts 403
-//!   without the `Referer` their own pages send. Android, iOS, and Desktop
-//!   apply these headers; the initial Web Host supports ordinary browser image
+//!   without the `Referer` their own pages send. Android, iOS, macOS, Linux, and
+//!   Windows apply these headers; the initial Web Host supports ordinary browser image
 //!   requests but reports an error for non-empty custom headers.
 //! - `style` — structured Whisker CSS declarations. Width / height must be
 //!   set on the element (or via flex sizing) — Kingfisher / Coil
@@ -69,6 +71,9 @@
 
 use whisker::prelude::*;
 use whisker::runtime::view::Element;
+
+#[cfg(feature = "loader")]
+pub mod loader;
 
 /// Content-fit mode for an [`Image`]. The variant names mirror the
 /// camelCase wire strings the iOS and Android image-view modules
@@ -239,7 +244,8 @@ pub fn image(
     /// Opt-in URL-keyed temporary-file cache with bounded decoded-image memory.
     ///
     /// Decode dimensions are physical pixels and preserve the source aspect ratio.
-    /// Web uses the browser cache and cannot enforce these limits.
+    /// Web uses the browser cache and Windows loads it as an ordinary image, so
+    /// neither enforces these limits.
     #[prop(default = None.into())]
     cache: Signal<Option<ImageCacheOptions>>,
     /// The bitmap arrived and is on screen; `detail` carries its size.
@@ -317,7 +323,8 @@ pub struct ImageCacheOptions {
 /// decoded images. Zero disables retention. Visible images, temporary decode
 /// allocations and GPU resources are outside this budget. Ordinary `Image`s
 /// without cache options retain their existing loader policy.
-/// Web returns an error because its cache belongs to the browser.
+/// Web returns an error because its cache belongs to the browser, and Windows
+/// because its Host has no managed cache.
 pub async fn configure_image_cache(max_bytes: usize) -> Result<(), String> {
     cache_operation("configureCache", max_bytes.to_string()).await
 }
@@ -326,6 +333,7 @@ pub async fn configure_image_cache(max_bytes: usize) -> Result<(), String> {
 ///
 /// Currently displayed images remain visible. Await completion before requesting
 /// the URL again. HTTP headers never participate in this cache's identity.
+/// Web and Windows return an error because they keep no managed cache.
 pub async fn remove_cached_image(url: &str) -> Result<(), String> {
     cache_operation("removeCached", url.to_owned()).await
 }

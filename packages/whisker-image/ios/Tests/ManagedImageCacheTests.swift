@@ -1,7 +1,9 @@
 import XCTest
 import ImageIO
-import UIKit
 import CryptoKit
+#if canImport(UIKit)
+import UIKit
+#endif
 @testable import WhiskerImage
 
 final class ManagedImageCacheTests: XCTestCase {
@@ -46,6 +48,7 @@ final class ManagedImageCacheTests: XCTestCase {
         XCTAssertEqual(cache.retainedBytes, 0)
         XCTAssertThrowsError(try cache.load("https://example.com/a", headers: [:], json: #"{"decode_width":0}"#))
     }
+    #if canImport(UIKit)
     @MainActor
     func testNativeViewUsesDecodeBoundsAndReportsErrors() throws {
         let url = "https://example.com/" + UUID().uuidString
@@ -81,5 +84,6 @@ final class ManagedImageCacheTests: XCTestCase {
         wait(for: [failed], timeout: 5)
         XCTAssertNil(view.view().image)
     }
+    #endif
 
 }
