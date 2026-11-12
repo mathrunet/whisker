@@ -585,6 +585,8 @@ impl WhiskerModule for BuiltInElementModule {
                     },
                     |state| state.scroll_enabled = true,
                 )
+                // Desktop scroll containers draw no scroll indicator to hide.
+                .prop("show-scroll-indicator", |_, _| {}, |_| {})
                 .scroll_behavior(
                     |state| state.horizontal,
                     |state| state.item_snap,
