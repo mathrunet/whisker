@@ -127,6 +127,7 @@ Play service-account assertions are sent only to
 `https://oauth2.googleapis.com/token`. Validate `token_uri` before parsing the
 private key or signing an assertion. Token requests do not follow redirects,
 including redirects to another HTTPS host. Custom token endpoints are unsupported.
+
 ## Plaintext credential staging
 
 Signing tools receive temporary files owned by the CLI process. Files are created
@@ -136,6 +137,7 @@ including non-interactive builds. Cleanup stops tracked build children first and
 removes only staging directories registered by that process. SIGKILL, process
 aborts, power loss, and filesystem errors can leave protected temporary files;
 inspect the operating system temporary directory after such failures.
+
 ## Trusting credential recipients
 
 Age encryption does not authenticate the author of a credential file. Anyone who

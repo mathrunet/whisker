@@ -496,6 +496,7 @@ one, operations fail instead of falling back to shared temporary storage. Unix
 application data directories and files use owner-only 0700 and 0600 permissions,
 respectively. Existing values are retained at their existing per-user location.
 Local-store is plaintext storage; use secure-store for secrets.
+
 ## WebView navigation origins
 
 Navigation patterns match parsed scheme, host and effective port, never URL
@@ -504,6 +505,7 @@ HTTPS port, excluding the apex; add a separate apex rule when needed. Explicit
 ports constrain the origin. The default broad `https://*` and `http://*` rules
 allow any valid host and port for their scheme. Empty or malformed lists reject
 navigation on both platforms, including initial and updated URL props.
+
 ## WebView bridge trust
 
 `message_origins` is an explicit set of exact HTTP(S) origins for incoming
@@ -512,6 +514,7 @@ of navigation's origin whitelist. Configure it alongside `on_message`. Iframes,
 opaque origins, wildcard origins and unsupported Android WebMessageListener
 implementations cannot send native bridge events. Native callback metadata, not
 JavaScript-supplied origin strings, determines the sender.
+
 ## Android deep links and authentication
 
 The generated Activity forwards only ACTION_VIEW intents whose URI scheme was
@@ -521,18 +524,21 @@ encoded path, and preserves any fixed callback query parameters. It does not inf
 authenticity from URL matching: the authentication caller must validate a fresh
 state value and complete PKCE verification before accepting an authorization code.
 Custom schemes may be invoked by any app, even when correctly registered.
+
 ## System-browser URL policy
 
 Web and desktop system-browser handoff and Android Custom Tabs accept only
 absolute HTTP(S) URLs. The Android ACTION_VIEW fallback applies the same policy.
 Authentication start URLs follow this policy; application callback schemes are
 validated separately and are not system-browser launch URLs.
+
 ## Secure-store key namespace
 
 Android reserves `__whisker_secure_keyset__` for its encrypted Tink keyset.
 Loading, saving or removing that key as application data fails before accessing
 the cryptographic state. Existing application keys and encrypted values are kept
 in place; no key migration or keyset rotation is performed.
+
 ## WebView mixed content
 
 Android WebView rejects HTTP subresources in HTTPS documents. Allowing an HTTP

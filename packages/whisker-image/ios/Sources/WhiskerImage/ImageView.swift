@@ -69,6 +69,35 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
     private var loadScheduled = false
     private var cacheOptions = ""
     private var requestVersion: UInt64 = 0
+    #if canImport(UIKit)
+    private var request: WhiskerImageRequest?
+    private var task: WhiskerImageTask?
+    private var shown: WhiskerLoadedImage?
+    private var decodesAtViewSize = true
+    private var awaitedLayout = false
+
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let request, request.targetPixelSize != .zero else { return }
+        let needed = targetPixelSize()
+        // A view that grew past what was decoded reloads only while the source has more pixels to give.
+        let outgrown = needed.width > request.targetPixelSize.width + 1 ||
+            needed.height > request.targetPixelSize.height + 1
+        let exhausted = shown.map {
+            $0.pixelSize.width >= $0.naturalSize.width && $0.pixelSize.height >= $0.naturalSize.height
+        } ?? false
+        if outgrown, !exhausted { scheduleLoad() }
+    }
+
+    private func targetPixelSize() -> CGSize {
+        guard decodesAtViewSize else { return .zero }
+        let scale = Self.screenScale
+        return CGSize(
+            width: (bounds.width * scale).rounded(.up),
+            height: (bounds.height * scale).rounded(.up)
+        )
+    }
+    #endif
 
     @objc public override func createView() -> WhiskerImageContentView {
         let v = WhiskerImageContentView()
@@ -132,37 +161,124 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
         return object.compactMapValues { $0 as? String }
     }
 
-    private func load() {
+    /// Loads through the managed cache when the `cache` prop is set; returns whether it did.
+    private func loadManaged() -> Bool {
+        guard !cacheOptions.isEmpty else { return false }
         let managed = (try? JSONSerialization.jsonObject(with: Data(cacheOptions.utf8))) as? [String: Any]
-        guard let value = cacheOptions.isEmpty ? currentSrc : managed?["_src"] as? String else { return }
+        guard let value = managed?["_src"] as? String else { return true }
 
         let imageView: WhiskerImageContentView = self.view()
-        if !cacheOptions.isEmpty {
-            imageView.kf.cancelDownloadTask()
-            imageView.image = nil
-            guard !value.isEmpty else { return }
-            let version = requestVersion
-            let options = cacheOptions
-            let headers = Self.parseHeaders(managed?["_headers"] as? String ?? "")
-            ManagedImageCache.shared.queue.async { [weak self] in
-                let result = Result { try ManagedImageCache.shared.load(value, headers: headers, json: options) }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.requestVersion == version else { return }
-                    switch result {
-                    case .success(let image):
-                        #if canImport(UIKit)
-                        imageView.image = UIImage(cgImage: image, scale: 1, orientation: .up)
-                        #else
-                        imageView.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-                        #endif
-                        WhiskerCustomEvent.dispatch(from: self, name: "load", params: ["width": image.width, "height": image.height])
-                    case .failure(let error):
-                        WhiskerCustomEvent.dispatch(from: self, name: "error", params: ["error": error.localizedDescription])
-                    }
+        #if canImport(UIKit)
+        task?.cancel()
+        task = nil
+        request = nil
+        shown = nil
+        #else
+        imageView.kf.cancelDownloadTask()
+        #endif
+        imageView.image = nil
+        guard !value.isEmpty else { return true }
+        let version = requestVersion
+        let options = cacheOptions
+        let headers = Self.parseHeaders(managed?["_headers"] as? String ?? "")
+        ManagedImageCache.shared.queue.async { [weak self] in
+            let result = Result { try ManagedImageCache.shared.load(value, headers: headers, json: options) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.requestVersion == version else { return }
+                switch result {
+                case .success(let image):
+                    #if canImport(UIKit)
+                    imageView.image = UIImage(cgImage: image, scale: 1, orientation: .up)
+                    #else
+                    imageView.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+                    #endif
+                    WhiskerCustomEvent.dispatch(from: self, name: "load", params: ["width": image.width, "height": image.height])
+                case .failure(let error):
+                    WhiskerCustomEvent.dispatch(from: self, name: "error", params: ["error": error.localizedDescription])
                 }
             }
+        }
+        return true
+    }
+
+    #if canImport(UIKit)
+    private func load() {
+        if loadManaged() { return }
+        guard let value = currentSrc else { return }
+        let imageView: WhiskerImageContentView = self.view()
+        guard let url = value.hasPrefix("/") ? URL(fileURLWithPath: value) : URL(string: value) else {
+            task?.cancel()
+            task = nil
+            request = nil
+            shown = nil
+            imageView.image = nil
             return
         }
+        let target = targetPixelSize()
+        if decodesAtViewSize, target.width <= 0 || target.height <= 0, !awaitedLayout {
+            // Props arrive before the first layout; one more turn lets the frame land.
+            awaitedLayout = true
+            scheduleLoad()
+            return
+        }
+        let next = WhiskerImageRequest(
+            url: url,
+            cacheKey: WhiskerImagePipeline.cacheKey(for: url, headers: currentHeaders),
+            headers: currentHeaders,
+            targetPixelSize: target.width > 0 && target.height > 0 ? target : .zero
+        )
+        if next == request { return }
+        task?.cancel()
+        task = nil
+        if next.cacheKey != request?.cacheKey {
+            shown = nil
+            imageView.image = nil
+        }
+        request = next
+        if let cached = WhiskerImagePipeline.shared.cached(next) {
+            show(cached, animated: false)
+            return
+        }
+        task = WhiskerImagePipeline.shared.load(next, scale: Self.screenScale) { [weak self] result, downloaded in
+            guard let self, self.request == next else { return }
+            self.task = nil
+            switch result {
+            case .success(let loaded):
+                self.show(loaded, animated: downloaded)
+            case .failure(let error):
+                WhiskerCustomEvent.dispatch(
+                    from: self,
+                    name: "error",
+                    params: ["error": error.localizedDescription]
+                )
+            }
+        }
+    }
+
+    private func show(_ loaded: WhiskerLoadedImage, animated: Bool) {
+        let imageView: WhiskerImageContentView = self.view()
+        shown = loaded
+        if animated {
+            UIView.transition(
+                with: imageView,
+                duration: 0.2,
+                options: [.transitionCrossDissolve, .allowUserInteraction]
+            ) { imageView.image = loaded.image }
+        } else {
+            imageView.image = loaded.image
+        }
+        WhiskerCustomEvent.dispatch(
+            from: self,
+            name: "load",
+            params: ["width": loaded.naturalSize.width, "height": loaded.naturalSize.height]
+        )
+    }
+    #else
+    private func load() {
+        if loadManaged() { return }
+        guard let value = currentSrc else { return }
+
+        let imageView: WhiskerImageContentView = self.view()
         // macOS bundles resolve `whisker-asset` paths to absolute file paths rather than URLs.
         guard let url = value.hasPrefix("/") ? URL(fileURLWithPath: value) : URL(string: value) else {
             // Clear the previous image so a bad URL doesn't leave a stale
@@ -239,15 +355,12 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
     }
 
     private static func pixelSize(of image: KFCrossPlatformImage) -> CGSize {
-        #if canImport(UIKit)
-        CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
-        #else
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return image.size
         }
         return CGSize(width: cgImage.width, height: cgImage.height)
-        #endif
     }
+    #endif
 
     private static var screenScale: CGFloat {
         #if canImport(UIKit)
@@ -274,6 +387,9 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
     static func prefetch(urls: [String], headers: [String: String]) {
         let targets = urls.compactMap(URL.init(string:)).filter { !$0.isFileURL }
         guard !targets.isEmpty else { return }
+        #if canImport(UIKit)
+        WhiskerImagePipeline.shared.prefetch(urls: targets, headers: headers)
+        #else
         var options: KingfisherOptionsInfo = [.cacheOriginalImage]
         if !headers.isEmpty {
             options.append(.requestModifier(AnyModifier { request in
@@ -288,6 +404,7 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
             KF.ImageResource(downloadURL: $0, cacheKey: cacheKey(for: $0, headers: headers))
         }
         ImagePrefetcher(resources: resources, options: options).start()
+        #endif
     }
 
     /// Shared with the module's `prefetch`, which has no view to ask.
@@ -303,6 +420,14 @@ public final class WhiskerImageView: WhiskerUI<WhiskerImageContentView> {
     /// the common presentation wrapper clip the painted bitmap.
     public func setMode(_ value: String) {
         let imageView: WhiskerImageContentView = self.view()
+        #if canImport(UIKit)
+        // `center` shows the source at its own size, so it is the one mode decoded in full.
+        let atViewSize = value != "center"
+        if atViewSize != decodesAtViewSize {
+            decodesAtViewSize = atViewSize
+            if currentSrc != nil { scheduleLoad() }
+        }
+        #endif
         switch value {
         case "aspectFill":
             imageView.contentMode = .scaleAspectFill

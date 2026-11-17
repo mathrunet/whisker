@@ -402,6 +402,7 @@ Thin rebuild capture persists only Cargo package metadata, crate and binary name
 manifest paths, the Cargo executable, and OUT_DIR. Registry configuration,
 authentication tokens, arbitrary CARGO_* variables, and jobserver descriptors
 are excluded. Do not use secret environment variables as compile-time app data.
+
 ## Authenticated native transport (protocol v1)
 
 The CLI provisions a fresh 128-bit OS-random secret for each native development
@@ -430,6 +431,7 @@ CLI and runtime must be rebuilt together after protocol updates. HMAC authentica
 but does not encrypt the connection. The OS debug transport and provisioned secret
 are trusted; reading the Android debug property compromises that session. OS
 randomness failure disables authenticated development transport.
+
 ## Browser development request boundary
 
 The dev server accepts only its bound address and port (plus localhost for a
@@ -439,6 +441,7 @@ clients require a configured session secret. Remote DNS names and cross-origin
 requests are rejected before static files or WebSocket handlers run. Native log
 and trace envelopes are ignored until authentication succeeds. Device log control
 characters are removed before either TUI or plain terminal output.
+
 ## Release environment boundary
 
 Release archive and Gradle launch commands remove `WHISKER_FEATURES` from their
