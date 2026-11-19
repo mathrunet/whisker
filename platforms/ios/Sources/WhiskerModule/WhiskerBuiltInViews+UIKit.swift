@@ -255,11 +255,14 @@ public final class WhiskerScrollContainerView: UIScrollView, UIScrollViewDelegat
             .sorted()
         let startPoint = scrollSequenceStart ?? contentOffset
         let start = horizontal ? startPoint.x : startPoint.y
+        // A drag that interrupts a settling snap starts just short of its target.
+        // Step from the nearest snap point so that target is not picked again.
+        let anchor = targets.min(by: { abs($0 - start) < abs($1 - start) }) ?? start
         let target: CGFloat
         if snapStopAlways, proposed > start + .ulpOfOne {
-            target = targets.first(where: { $0 > start + .ulpOfOne }) ?? targets.last ?? proposed
+            target = targets.first(where: { $0 > anchor + .ulpOfOne }) ?? targets.last ?? proposed
         } else if snapStopAlways, proposed < start - .ulpOfOne {
-            target = targets.last(where: { $0 < start - .ulpOfOne }) ?? targets.first ?? proposed
+            target = targets.last(where: { $0 < anchor - .ulpOfOne }) ?? targets.first ?? proposed
         } else {
             target = targets.min(by: { abs($0 - proposed) < abs($1 - proposed) }) ?? proposed
         }

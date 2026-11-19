@@ -1,5 +1,8 @@
 package rs.whisker.runtime
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Rect
@@ -8,6 +11,7 @@ import android.view.View
 import android.view.VelocityTracker
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ScrollView
@@ -164,6 +168,7 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
     private var userScrollEnabled = true
     private var scrollSequenceStart: Int? = null
     private var settleGeneration = 0
+    private var snapAnimator: ValueAnimator? = null
     private var dragging = false
     private var lastScrollX = 0.0
     private var lastScrollY = 0.0
@@ -363,6 +368,7 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
     public fun clearItemSnap() {
         snapFactor = null
         settleGeneration += 1
+        cancelSnapAnimation()
     }
 
     public fun setScrollSnapStop(value: String) {
@@ -395,6 +401,7 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
                 settleGeneration += 1
                 scrollSequenceStart = null
             }
+            cancelSnapAnimation()
             if (isHorizontal) {
                 if (smooth) horizontalScroller.smoothScrollTo(pixels, 0)
                 else horizontalScroller.scrollInstantlyTo(pixels, 0)
@@ -432,6 +439,8 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            // Stop a settling snap so the new gesture starts from where the content is.
+            cancelSnapAnimation()
             finishDrag(cancelled = true)
             velocityTracker = VelocityTracker.obtain()
             activePointerId = event.getPointerId(0)
@@ -485,6 +494,7 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
     }
 
     override fun onDetachedFromWindow() {
+        cancelSnapAnimation()
         finishDrag(cancelled = true)
         super.onDetachedFromWindow()
     }
@@ -534,7 +544,7 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
             override fun run() {
                 if (generation != settleGeneration || snapFactor == null) return
                 val current = if (horizontal) horizontalScroller.scrollX else verticalScroller.scrollY
-                if (current == previous) stableFrames += 1 else stableFrames = 0
+                if (current == previous && snapAnimator == null) stableFrames += 1 else stableFrames = 0
                 previous = current
                 if (stableFrames >= 2) {
                     snapToNearestChild()
@@ -550,32 +560,57 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
         val current = if (horizontal) horizontalScroller.scrollX else verticalScroller.scrollY
         val start = scrollSequenceStart ?: current
         val targets = snapTargets()
-        val target = (if (snapStopAlways && current > start) {
-            targets.firstOrNull { it > start } ?: targets.lastOrNull()
-        } else if (snapStopAlways && current < start) {
-            targets.lastOrNull { it < start } ?: targets.firstOrNull()
+        val target = (if (snapStopAlways && current != start) {
+            adjacentSnapTarget(targets, start, current.compareTo(start))
         } else {
             targets.minByOrNull { kotlin.math.abs(it - current) }
         }) ?: return
         scrollSequenceStart = null
         if (target == current) return
-        if (horizontal) horizontalScroller.smoothScrollTo(target, 0)
-        else verticalScroller.smoothScrollTo(0, target)
+        animateSnapTo(target)
     }
 
     private fun snapToAdjacentChild(direction: Int) {
         val current = if (horizontal) horizontalScroller.scrollX else verticalScroller.scrollY
         val start = scrollSequenceStart ?: current
         val targets = snapTargets()
-        val target = when {
-            direction > 0 -> targets.firstOrNull { it > start } ?: targets.lastOrNull()
-            direction < 0 -> targets.lastOrNull { it < start } ?: targets.firstOrNull()
-            else -> targets.minByOrNull { kotlin.math.abs(it - current) }
-        } ?: return
+        val target = (if (direction != 0) {
+            adjacentSnapTarget(targets, start, direction)
+        } else {
+            targets.minByOrNull { kotlin.math.abs(it - current) }
+        }) ?: return
         scrollSequenceStart = null
         settleGeneration += 1
-        if (horizontal) horizontalScroller.smoothScrollTo(target, 0)
-        else verticalScroller.smoothScrollTo(0, target)
+        animateSnapTo(target)
+    }
+
+    // smoothScrollTo jumps without animating when called within 250 ms of the
+    // previous smooth scroll, which a quick follow-up swipe easily hits.
+    private fun animateSnapTo(target: Int) {
+        cancelSnapAnimation()
+        val scroller = activeScroller()
+        val current = if (horizontal) scroller.scrollX else scroller.scrollY
+        if (target == current) return
+        snapAnimator = ValueAnimator.ofInt(current, target).apply {
+            duration = SNAP_DURATION_MS
+            interpolator = DecelerateInterpolator(1.5f)
+            addUpdateListener { animator ->
+                val value = animator.animatedValue as Int
+                if (horizontal) scroller.scrollTo(value, 0) else scroller.scrollTo(0, value)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (snapAnimator === animation) snapAnimator = null
+                }
+            })
+            start()
+        }
+    }
+
+    private fun cancelSnapAnimation() {
+        val animator = snapAnimator ?: return
+        snapAnimator = null
+        animator.cancel()
     }
 
     private fun snapTargets(): List<Int> {
@@ -600,3 +635,21 @@ public class WhiskerScrollContainerView(context: Context) : FrameLayout(context)
 }
 
 private data class OverflowExtent(val right: Float, val bottom: Float)
+
+private const val SNAP_DURATION_MS = 250L
+
+/**
+ * Picks the snap target one step from [start] in [direction] for `scroll-snap-stop: always`.
+ *
+ * A drag that interrupts a settling snap starts just short of its target, so the step is
+ * taken from the snap point nearest to [start] instead of [start] itself. Otherwise the
+ * interrupted target would be picked again and the content would jump back to it.
+ */
+internal fun adjacentSnapTarget(targets: List<Int>, start: Int, direction: Int): Int? {
+    val anchor = targets.minByOrNull { kotlin.math.abs(it - start) } ?: return null
+    return when {
+        direction > 0 -> targets.firstOrNull { it > anchor } ?: targets.lastOrNull()
+        direction < 0 -> targets.lastOrNull { it < anchor } ?: targets.firstOrNull()
+        else -> anchor
+    }
+}
