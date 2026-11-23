@@ -94,6 +94,15 @@ Android, iOS, and macOS carry these interactions through the mobile FFI Driver.
 Web and Linux use Rust calls directly. The Driver adapts the boundary; it
 does not take over layout, scheduling policy, or platform drawing.
 
+On Android, a foreground service can outlive the Activity, for example when the
+user removes the task from Recents during playback. A native module that keeps
+such work running holds a `WhiskerRuntimeRetention` lease. When the host
+Activity is destroyed while a lease is held, a view created with
+`WhiskerView.obtain` detaches without destroying its runtime. The runtime keeps
+processing module events and task wakes without a window. The next Activity that
+calls `WhiskerView.obtain` adopts the same view, scene, and runtime. Releasing
+the last lease destroys a runtime that is still windowless.
+
 ### Shared UI terms
 
 A few terms recur throughout the implementation:
