@@ -63,13 +63,11 @@ The Runtime uses that answer to decide where the text and its siblings belong.
 The Host then draws those boxes. Measuring a leaf is a Host responsibility;
 laying out the application tree is a Runtime responsibility.
 
-On Android, the Host waits for a non-null root `WindowInsets` snapshot before
-driving its first frame. A valid all-zero snapshot also permits that frame.
-Queued module events are delivered before each frame is laid out, so initial
-safe-area notifications are applied before presentation. The safe-area module
-also reads the current window insets synchronously on its first Rust access;
-screens mounted during a frame do not have to wait for an event-loop turn to
-reserve space for system bars and display cutouts.
+On Android, queued module events are delivered before each frame is laid out,
+so initial safe-area notifications are applied before presentation. The
+safe-area module also reads the current window insets synchronously on its
+first Rust access; screens mounted during a frame do not have to wait for an
+event-loop turn to reserve space for system bars and display cutouts.
 
 ### What crosses the boundary
 
@@ -95,15 +93,6 @@ transitions; the Runtime implements what those transitions do to UI state.
 Android, iOS, and macOS carry these interactions through the mobile FFI Driver.
 Web and Linux use Rust calls directly. The Driver adapts the boundary; it
 does not take over layout, scheduling policy, or platform drawing.
-
-Android and iOS apps that already run background work, such as audio playback,
-can opt into event-driven task and effect processing while their Host view is
-hidden or inactive. Set `WhiskerRunsInBackground` to `true` in the iOS
-`Info.plist`, or set application metadata `rs.whisker.runsInBackground` to
-`true` in the Android manifest. The Host processes native events and task
-wakes without measuring or presenting the scene. The setting does not grant
-background permissions or keep the process running when the OS suspends it.
-Detaching the view still pauses its runtime.
 
 ### Shared UI terms
 
@@ -249,20 +238,6 @@ launch shells are written in Kotlin, Swift, and C++:
 Web and Linux do not pass through this mobile ABI. They instantiate the
 runtime directly and supply Rust implementations of the same Host boundaries.
 
-### Android input line boxes
-
-`whisker-input` shares its resolved line box between the measuring `StaticLayout`
-and the native `EditText`. An explicit `line-height` uses a `LineHeightSpan` for
-text and hints, with half-leading split between the view's top and bottom
-padding. Heights below the primary font's natural height are clamped to that
-height because view padding cannot represent negative half-leading.
-
-The final line retains the primary font's descent so a trailing newline's empty,
-span-less line has the same geometry. Both layouts enable fallback line spacing;
-on API 35 and later the view disables the locale-preferred minimum line height.
-When an auto-sized field grows, it clamps its old scroll offset to the new
-content bounds so the first line remains visible.
-
 ### Scrolling, lists, and platform modules
 
 A `ScrollView` makes the boundary especially visible. The Runtime lays out its
@@ -347,6 +322,7 @@ The tooling has a different lifetime from the shipped UI runtime:
 | [`whisker-cng`](../crates/whisker-cng/) and [`whisker-plugin`](../crates/whisker-plugin/) | Discover modules, build and apply plugins, and generate platform projects |
 | [`whisker-build`](../crates/whisker-build/) | Compiles and packages application artifacts with the target toolchain |
 | [`whisker-dev-server`](../crates/whisker-dev-server/) | Coordinates the native development session, watching, patch delivery, and reload commands |
+| [`whisker-dev-protocol`](../crates/whisker-dev-protocol/) | Authenticates the development channel between `whisker-dev-server` and the app's `whisker-dev-runtime` |
 
 `whisker run` generates the target project, builds and launches it, then watches
 for changes. Hot Reload compiles eligible Rust edits into patches and applies
@@ -387,14 +363,6 @@ For focused explanations, continue with [reactivity](reactivity-design.md),
 [lists](list-design.md), [routing](router-design.md), or
 [animation](animation-design.md). These documents describe the current design;
 issues, PRs, and Git history preserve the discussions behind it.
-
-## Android cleartext policy
-
-The generated main manifest denies cleartext traffic by default. A debug-only
-manifest overlay enables development connections; release variants do not include
-that overlay. Applications that require production HTTP must explicitly configure
-their Android network policy. Verify the final merged manifest when using plugins
-that supply network security configuration or application-attribute overrides.
 
 ## Gradle wrapper integrity
 

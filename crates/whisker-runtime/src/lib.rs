@@ -39,6 +39,7 @@ pub mod text_query;
 mod transform_interpolation;
 pub mod value;
 pub mod view;
+mod viewport;
 
 /// Link-time registration hooks used by `#[whisker::module_element]`.
 ///
@@ -60,6 +61,8 @@ pub use element_registry::{
 };
 pub use frame_timing::FrameTiming;
 pub use runtime_context::RuntimeContext;
+#[doc(hidden)]
+pub use runtime_context::{WeakRuntimeContext, current_runtime_context};
 pub use runtime_instance::{
     RuntimeDrive, RuntimeDriveError, RuntimeEventError, RuntimeInstance, RuntimeLifecycle,
     RuntimeLifecycleError,
@@ -75,3 +78,4 @@ pub use surface_runtime::{
     RuntimeInputError, RuntimeLayoutError, RuntimePresentError, RuntimeResourceError,
     SurfaceRuntime, standard_element_registrations,
 };
+pub use viewport::{Viewport, viewport};
