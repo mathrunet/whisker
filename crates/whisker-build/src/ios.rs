@@ -81,8 +81,8 @@ const BRIDGE_EXPORTS: &[&str] = &[
 /// `--release` is always set regardless of `capture` — iOS dev's
 /// hot reload capture wants the same optimised codegen prod ships. The
 /// only thing that changes when `capture` is `Some` is the env-var
-/// envelope (RUSTC_WORKSPACE_WRAPPER, the linker shim, save-temps,
-/// debug-assertions, export-dynamic) — see [`crate::capture_env_vars`].
+/// envelope (RUSTC_WORKSPACE_WRAPPER, the linker shim, debug-assertions,
+/// export-dynamic) — see [`crate::capture_env_vars`].
 fn cargo_build_ios_dylib(
     workspace_root: &Path,
     package: &str,
@@ -128,6 +128,9 @@ fn cargo_build_ios_dylib(
         cmd.arg(format!("-Clink-arg=-Wl,-exported_symbol,{sym}"));
     }
     cmd.args(strip_link_args(hot_reload));
+    if hot_reload {
+        cmd.arg(crate::capture::SAVE_TEMPS);
+    }
     if let Some(c) = capture {
         std::fs::create_dir_all(&c.rustc_cache_dir)
             .with_context(|| format!("create rustc cache dir {}", c.rustc_cache_dir.display()))?;
@@ -271,6 +274,9 @@ pub struct XcodeRunScriptInputs<'a> {
     /// dylib carries the dev-runtime WebSocket client; direct `xcodebuild` invocations
     /// leaves this empty for prod.
     pub features: &'a [String],
+    /// Hot reload capture envelope; `None` when the caller's environment
+    /// already carries it (xcodebuild's Build Phase) or the build is plain.
+    pub capture: Option<&'a CaptureShims>,
 }
 
 /// Cross-compile + framework-wrap path for the Xcode Run Script
@@ -305,7 +311,7 @@ pub fn build_framework_for_xcode_run_script(
             inputs.package,
             triple,
             inputs.features,
-            None,
+            inputs.capture,
             &s,
         )?;
         s.done("");
