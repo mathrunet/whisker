@@ -272,7 +272,7 @@ pub mod __main_runtime {
     ///   body land in the *user crate's* compilation unit at every
     ///   call site, so the wrapper closure's `<F as HotFunction<()>>::
     ///   call_it` monomorphization is part of `libhello_world.so`
-    ///   (host) *and* `target/.whisker/patches/libhello_world.so` (patch).
+    ///   (host) *and* `target/.whisker/patches/<triple>/libhello_world.so` (patch).
     ///   That's the symbol `subsecond::apply_patch`'s JumpTable maps
     ///   host → patch; without it, hot patches don't dispatch and the
     ///   screen keeps showing pre-edit content.

@@ -28,7 +28,15 @@ use super::{
     CapturedLinkerInvocation, CapturedRustcInvocation, HotpatchModuleCache, LinkerOs, PatchPlan,
     build_jump_table, build_link_plan, load_captured_args, load_captured_linker_args,
     parse_symbol_table, run_link_plan, run_obj_plan, thin_build, validate_environment,
+    wrapper::triple_dir_name,
 };
+
+/// Where thin builds for `target_triple` write their objects, stubs, and patch libraries.
+pub fn patch_dir(workspace_root: &Path, target_triple: Option<&str>) -> PathBuf {
+    workspace_root
+        .join("target/.whisker/patches")
+        .join(triple_dir_name(target_triple))
+}
 
 /// Single-slot in-session cache of the stub `.o` we synthesize for the
 /// patch dylib. Most edits only change a function *body*; the set of
@@ -116,7 +124,7 @@ impl Patcher {
             .with_context(|| format!("load linker cache {}", linker_cache_dir.display()))?;
         let original_cache = HotpatchModuleCache::from_path(original_binary)
             .with_context(|| format!("parse original binary {}", original_binary.display()))?;
-        let patch_out_dir = workspace_root.join("target/.whisker/patches");
+        let patch_out_dir = patch_dir(workspace_root, target_triple);
         // Thin-build incremental state only pays off within one session and otherwise grows without bound.
         let _ = std::fs::remove_dir_all(patch_out_dir.join("incremental"));
         let rustc_path = current_rustc();
@@ -509,6 +517,16 @@ fn read_image_base(path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::hotpatch::SymbolTable;
+
+    #[test]
+    fn patch_dir_is_separate_per_triple() {
+        let ws = Path::new("/tmp/ws");
+        let ios = patch_dir(ws, Some("aarch64-apple-ios-sim"));
+        let android = patch_dir(ws, Some("aarch64-linux-android"));
+        assert_ne!(ios, android);
+        assert!(ios.ends_with("target/.whisker/patches/aarch64-apple-ios-sim"));
+        assert!(patch_dir(ws, None).ends_with("target/.whisker/patches/host"));
+    }
 
     fn empty_cache() -> HotpatchModuleCache {
         HotpatchModuleCache {

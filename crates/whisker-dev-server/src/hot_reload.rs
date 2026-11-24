@@ -145,10 +145,14 @@ pub(super) struct HotReloadPrep {
 ///   - others → host clang via [`hotpatch::wrapper::resolve_linker`].
 pub(super) fn prepare_hot_reload_capture(config: &Config) -> Result<HotReloadPrep> {
     let shims = hotpatch::resolve_shim_paths(&config.workspace_root)?;
-    let rustc_cache_dir = hotpatch::wrapper::default_cache_dir(&config.workspace_root);
-    let linker_cache_dir = hotpatch::wrapper::default_linker_cache_dir(&config.workspace_root);
-    let real_linker = resolve_linker_for(config)?;
     let target_triple = target_triple_for(config);
+    let rustc_cache_dir =
+        hotpatch::wrapper::default_cache_dir(&config.workspace_root, target_triple.as_deref());
+    let linker_cache_dir = hotpatch::wrapper::default_linker_cache_dir(
+        &config.workspace_root,
+        target_triple.as_deref(),
+    );
+    let real_linker = resolve_linker_for(config)?;
     Ok(HotReloadPrep {
         capture: CaptureShims {
             rustc_shim: shims.rustc_shim,

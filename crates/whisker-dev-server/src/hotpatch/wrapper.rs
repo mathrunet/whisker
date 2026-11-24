@@ -281,16 +281,25 @@ pub fn keep_newest_linker(
     }
 }
 
+/// Per-triple subdirectory, so concurrent sessions for different targets never share hot-reload state.
+pub fn triple_dir_name(target_triple: Option<&str>) -> &str {
+    target_triple.unwrap_or("host")
+}
+
 /// Convenience: best-effort default cache dir under the workspace's
-/// `target/.whisker/rustc-args/`. Created on demand.
-pub fn default_cache_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("target/.whisker/rustc-args")
+/// `target/.whisker/rustc-args/<triple>/`. Created on demand.
+pub fn default_cache_dir(workspace_root: &Path, target_triple: Option<&str>) -> PathBuf {
+    workspace_root
+        .join("target/.whisker/rustc-args")
+        .join(triple_dir_name(target_triple))
 }
 
 /// Counterpart of [`default_cache_dir`] for the linker side:
-/// `target/.whisker/linker-args/`. Created on demand.
-pub fn default_linker_cache_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("target/.whisker/linker-args")
+/// `target/.whisker/linker-args/<triple>/`. Created on demand.
+pub fn default_linker_cache_dir(workspace_root: &Path, target_triple: Option<&str>) -> PathBuf {
+    workspace_root
+        .join("target/.whisker/linker-args")
+        .join(triple_dir_name(target_triple))
 }
 
 /// Resolve the system linker driver we want to forward to from the
@@ -623,8 +632,21 @@ mod tests {
 
     #[test]
     fn default_cache_dir_lives_under_target_dot_whisker() {
-        let p = default_cache_dir(Path::new("/tmp/ws"));
-        assert!(p.ends_with("target/.whisker/rustc-args"));
+        let p = default_cache_dir(Path::new("/tmp/ws"), Some("aarch64-apple-ios-sim"));
+        assert!(p.ends_with("target/.whisker/rustc-args/aarch64-apple-ios-sim"));
+    }
+
+    #[test]
+    fn default_cache_dirs_are_separate_per_triple() {
+        let ws = Path::new("/tmp/ws");
+        let ios = Some("aarch64-apple-ios-sim");
+        let android = Some("aarch64-linux-android");
+        assert_ne!(default_cache_dir(ws, ios), default_cache_dir(ws, android));
+        assert_ne!(
+            default_linker_cache_dir(ws, ios),
+            default_linker_cache_dir(ws, android)
+        );
+        assert!(default_cache_dir(ws, None).ends_with("target/.whisker/rustc-args/host"));
     }
 
     // ----- run_fat_build (integration: runs a real cargo) ---------------
@@ -860,8 +882,8 @@ mod tests {
 
     #[test]
     fn default_linker_cache_dir_lives_under_target_dot_whisker() {
-        let p = default_linker_cache_dir(Path::new("/tmp/ws"));
-        assert!(p.ends_with("target/.whisker/linker-args"));
+        let p = default_linker_cache_dir(Path::new("/tmp/ws"), Some("aarch64-linux-android"));
+        assert!(p.ends_with("target/.whisker/linker-args/aarch64-linux-android"));
     }
 
     #[test]
