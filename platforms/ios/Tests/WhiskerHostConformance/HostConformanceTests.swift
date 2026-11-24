@@ -1081,6 +1081,40 @@ final class HostConformanceTests: XCTestCase {
         XCTAssertEqual(release(from: 320, proposing: 400, velocity: 0), 640)
     }
 
+    func testDragDuringEdgeBounceStaysOnTheEdgePage() {
+        let scrollView = WhiskerScrollContainerView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        scrollView.setScrollOrientation("horizontal")
+        scrollView.setItemSnap(factor: 0, offset: 0)
+        scrollView.setScrollSnapStop("always")
+        for index in 0..<4 {
+            scrollView.contentView.addSubview(
+                UIView(frame: CGRect(x: index * 320, y: 0, width: 320, height: 180))
+            )
+        }
+        scrollView.layoutIfNeeded()
+
+        func release(from start: CGFloat, proposing x: CGFloat, velocity: CGFloat) -> CGFloat {
+            scrollView.contentOffset = CGPoint(x: start, y: 0)
+            scrollView.scrollViewWillBeginDragging(scrollView)
+            var proposed = CGPoint(x: x, y: 0)
+            scrollView.scrollViewWillEndDragging(
+                scrollView,
+                withVelocity: CGPoint(x: velocity, y: 0),
+                targetContentOffset: &proposed
+            )
+            return proposed.x
+        }
+
+        // Swiping further while the content still bounces past the last or first page.
+        XCTAssertEqual(release(from: 990, proposing: 960, velocity: 1), 960)
+        XCTAssertEqual(release(from: -30, proposing: 0, velocity: -1), 0)
+        // Swiping back out of the bounce still moves to the neighbouring page.
+        XCTAssertEqual(release(from: 990, proposing: 700, velocity: -1), 640)
+        XCTAssertEqual(release(from: -30, proposing: 200, velocity: 1), 320)
+    }
+
 #endif
 #if canImport(UIKit)
     func testScrollOverflowClipUsesStationaryViewportInsteadOfMovingContent() throws {

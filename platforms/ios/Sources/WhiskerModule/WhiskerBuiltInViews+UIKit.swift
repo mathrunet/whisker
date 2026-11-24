@@ -254,7 +254,10 @@ public final class WhiskerScrollContainerView: UIScrollView, UIScrollViewDelegat
             }
             .sorted()
         let startPoint = scrollSequenceStart ?? contentOffset
-        let start = horizontal ? startPoint.x : startPoint.y
+        // A drag that starts while the content bounces past an edge reports an
+        // offset out of range, while UIKit proposes an in-range one. Clamp it so
+        // the bounce back is not taken as a swipe toward the opposite page.
+        let start = (horizontal ? startPoint.x : startPoint.y).clamped(to: 0...maximum)
         // A drag that interrupts a settling snap starts just short of its target.
         // Step from the nearest snap point so that target is not picked again.
         let anchor = targets.min(by: { abs($0 - start) < abs($1 - start) }) ?? start
