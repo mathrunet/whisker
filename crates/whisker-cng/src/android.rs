@@ -796,7 +796,7 @@ mod tests {
             MAIN_ACTIVITY_KT
                 .contains("window.setBackgroundDrawableResource(R.color.whisker_background)")
         );
-        assert!(MAIN_ACTIVITY_KT.contains("setContentView(WhiskerView(this))"));
+        assert!(MAIN_ACTIVITY_KT.contains("setContentView(WhiskerView.obtain(this))"));
         assert!(MAIN_ACTIVITY_KT.contains("override fun onNewIntent(intent: Intent)"));
         assert!(
             MAIN_ACTIVITY_KT.contains(
