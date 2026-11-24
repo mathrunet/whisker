@@ -71,7 +71,7 @@ that produces the installable artifact) runs with the capture shims
 wired in (`prepare_hot_reload_capture` in `lib.rs`):
 
 - `whisker-rustc-shim` records each relevant rustc invocation's argv to
-  `<workspace>/target/.whisker/cache/rustc-args/`,
+  `<workspace>/target/.whisker/rustc-args/<triple>/`,
   along with the `CARGO_*` / `OUT_DIR` environment cargo set for it
   (minus `CARGO_MAKEFLAGS`, whose jobserver fds die with cargo). The
   thin rebuild replays those vars so `env!("CARGO_PKG_*")` /
