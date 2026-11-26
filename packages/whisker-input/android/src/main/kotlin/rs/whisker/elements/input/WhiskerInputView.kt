@@ -440,6 +440,9 @@ open class WhiskerInputView(context: WhiskerContext) : WhiskerUI<android.widget.
 
     fun blurField() {
         val et = view()
+        // Apps blur on every scrolled frame (keyboard dismiss on drag); without focus there is no
+        // keyboard of ours to hide, and the IME call is a binder round trip per frame.
+        if (!et.isFocused) return
         et.clearFocus()
         val imm = et.context.getSystemService(Context.INPUT_METHOD_SERVICE)
             as? InputMethodManager ?: return

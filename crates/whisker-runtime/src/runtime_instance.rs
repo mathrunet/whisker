@@ -122,6 +122,38 @@ mod tests {
     }
 
     #[test]
+    fn idle_background_drive_does_not_wake_the_runtime_again() {
+        __reset_for_tests();
+        let surface = SurfaceRuntime::new(
+            SurfaceId::new(80).unwrap(),
+            StyleEnvironment::new(320.0, 100.0, 1.0, 14.0),
+        );
+        let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake = std::sync::Arc::clone(&wake_count);
+        let mut runtime = RuntimeInstance::new(
+            surface,
+            RuntimeWakeHandle::new(move || {
+                wake.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let modules = ModuleHost::new(|_, _, _, _, _| false, |_, _, _| {});
+        with_module_host(&modules, || {
+            runtime.mount(|| create_element(ElementTag::View)).unwrap();
+        });
+        with_module_host(&modules, || runtime.drive_background()).unwrap();
+
+        // A Host schedules another background drive for every wake, so an idle
+        // drive must not wake the runtime or it never stops driving.
+        let before = wake_count.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            with_module_host(&modules, || runtime.drive_background()).unwrap();
+        }
+        assert_eq!(wake_count.load(Ordering::Relaxed), before);
+
+        runtime.unmount().unwrap();
+    }
+
+    #[test]
     fn one_input_event_takes_one_surface_snapshot_for_text_and_style_updates() {
         __reset_for_tests();
         let surface = SurfaceRuntime::new(
@@ -1688,6 +1720,7 @@ impl RuntimeInstance {
                         || drained_events > 0
                         || reactive::has_pending_work()
                         || surface.has_active_motion()
+                        || surface.has_deferred_presentation()
                         || !self.pending_host_events.borrow().is_empty(),
                 })
             })

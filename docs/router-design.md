@@ -464,6 +464,13 @@ The barrier ignores pointer input, so the screen itself decides what a tap
 on its uncovered area does. A back gesture over a translucent route skips
 the Material backdrop dim, which the barrier already provides.
 
+On Android, a route backdrop blur is refreshed when an ancestor moves or
+when a view painted before the blur is invalidated. Scrolling content painted
+above the blur leaves the backdrop display list intact. Repainting the blur
+element itself can reuse the recorded backdrop when its source and crop are
+unchanged. On iOS, rectangular backdrop blur views clip to their bounds.
+Rounded blur views use a shape mask.
+
 `dismissTo(href)` from Expo/React Navigation (dismiss the modal stack
 until a target) is just **`pop_to`** in this model, because a modal is an
 ordinary stack route. No separate dismissal API is needed.

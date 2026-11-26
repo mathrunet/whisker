@@ -23,6 +23,8 @@ internal fun drawOuterBoxShadows(
     geometry: ResolvedBoxGeometry?,
     shadows: List<HostBoxShadow>,
 ) {
+    // Every node draws through here, so skip the clip and allocations when nothing is cast.
+    if (shadows.isEmpty() || shadows.none { !it.inset }) return
     val box = geometry ?: return
     if (box.width <= 0f || box.height <= 0f) return
     val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -64,6 +66,7 @@ internal fun drawInsetBoxShadows(
     geometry: ResolvedBoxGeometry?,
     shadows: List<HostBoxShadow>,
 ) {
+    if (shadows.isEmpty() || shadows.none { it.inset }) return
     val box = geometry ?: return
     val top = box.borderWidths[0].coerceIn(0f, box.height)
     val right = box.borderWidths[1].coerceIn(0f, box.width)

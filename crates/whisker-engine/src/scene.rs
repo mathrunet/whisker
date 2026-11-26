@@ -321,6 +321,45 @@ pub struct Scene {
     pointer_captures: BTreeMap<PointerId, NodeId>,
     journal: ChangeJournal,
     pending: Option<FramePacket>,
+    deferred: BTreeMap<NodeId, DeferredPresentation>,
+}
+
+/// Property values held back from the Host because they would not change any pixel.
+///
+/// The retained node always stores the exact requested value; this records what the Host was last
+/// sent. A value that stops changing is sent exactly on the following frame, so an animation's
+/// final pose is never left a fraction of a pixel off.
+#[derive(Clone, Copy, Debug, Default)]
+struct DeferredPresentation {
+    transform: Option<Transform>,
+    opacity: Option<f32>,
+    touched: bool,
+}
+
+/// Largest translation, in logical pixels, a Host is not sent while it keeps changing.
+const DEFERRED_TRANSLATION: f32 = 0.25;
+/// Largest change of any other matrix entry a Host is not sent while it keeps changing.
+const DEFERRED_LINEAR: f32 = 1.0e-4;
+
+/// True when `next` places every point within a quarter logical pixel of where `sent` does.
+fn transform_visually_equal(sent: &Transform, next: &Transform) -> bool {
+    sent.0
+        .iter()
+        .zip(next.0.iter())
+        .enumerate()
+        .all(|(index, (a, b))| {
+            let limit = if (12..15).contains(&index) {
+                DEFERRED_TRANSLATION
+            } else {
+                DEFERRED_LINEAR
+            };
+            (a - b).abs() < limit
+        })
+}
+
+/// True when both opacities composite to the same 8-bit alpha.
+fn opacity_visually_equal(sent: f32, next: f32) -> bool {
+    (sent * 255.0).round() == (next * 255.0).round() && (sent == 0.0) == (next == 0.0)
 }
 
 impl Scene {
@@ -343,6 +382,7 @@ impl Scene {
             pointer_captures: BTreeMap::new(),
             journal: ChangeJournal::default(),
             pending: None,
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -381,6 +421,11 @@ impl Scene {
         self.pointer_captures.get(&pointer).copied()
     }
 
+    /// Returns whether any pointer capture is retained.
+    pub fn has_pointer_captures(&self) -> bool {
+        !self.pointer_captures.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_scene_epoch_for_tests(&mut self, scene_epoch: u32) {
         self.scene_epoch = scene_epoch;
@@ -388,7 +433,64 @@ impl Scene {
 
     /// Returns whether a snapshot, mutation, command, or retry needs a frame.
     pub fn has_pending_work(&self) -> bool {
-        self.pending.is_some() || self.needs_snapshot || !self.journal.operations.is_empty()
+        self.pending.is_some()
+            || self.needs_snapshot
+            || !self.journal.operations.is_empty()
+            || !self.deferred.is_empty()
+    }
+
+    /// Returns whether a value was held back from the Host and still has to be sent exactly.
+    pub fn has_deferred_presentation(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    fn clear_deferred_transform(&mut self, node: NodeId) {
+        if let Some(deferred) = self.deferred.get_mut(&node) {
+            deferred.transform = None;
+            if deferred.opacity.is_none() {
+                self.deferred.remove(&node);
+            }
+        }
+    }
+
+    fn clear_deferred_opacity(&mut self, node: NodeId) {
+        if let Some(deferred) = self.deferred.get_mut(&node) {
+            deferred.opacity = None;
+            if deferred.transform.is_none() {
+                self.deferred.remove(&node);
+            }
+        }
+    }
+
+    /// Sends the exact value of every held-back property that did not change since the previous
+    /// frame, and starts a new frame of change tracking for the rest.
+    fn settle_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred);
+        for (node, mut entry) in deferred {
+            let Some(state) = self.nodes.get(&node) else {
+                continue;
+            };
+            if entry.touched {
+                entry.touched = false;
+                self.deferred.insert(node, entry);
+                continue;
+            }
+            if let (Some(_), Some(transform)) = (entry.transform, state.transform) {
+                self.journal.push_coalesced(
+                    DirtySlot::Transform(node),
+                    Operation::SetTransform { node, transform },
+                );
+            }
+            if let (Some(_), Some(opacity)) = (entry.opacity, state.opacity) {
+                self.journal.push_coalesced(
+                    DirtySlot::Opacity(node),
+                    Operation::SetOpacity { node, opacity },
+                );
+            }
+        }
     }
 
     /// Returns whether a prepared frame is waiting for acceptance or discard.
@@ -663,14 +765,29 @@ impl Scene {
         if !transform.0.into_iter().all(f32::is_finite) {
             return Err(SceneError::NonFiniteNumber);
         }
-        if self.require_node(node)?.transform == Some(transform) {
+        let retained = self.require_node(node)?.transform;
+        if retained == Some(transform) {
             return Ok(());
         }
+        let sent = self
+            .deferred
+            .get(&node)
+            .and_then(|deferred| deferred.transform)
+            .or(retained);
         self.nodes
             .get_mut(&node)
             .map(Arc::make_mut)
             .expect("node checked above")
             .transform = Some(transform);
+        if let Some(sent) =
+            sent.filter(|sent| !self.needs_snapshot && transform_visually_equal(sent, &transform))
+        {
+            let deferred = self.deferred.entry(node).or_default();
+            deferred.transform = Some(sent);
+            deferred.touched = true;
+            return Ok(());
+        }
+        self.clear_deferred_transform(node);
         self.journal.push_coalesced(
             DirtySlot::Transform(node),
             Operation::SetTransform { node, transform },
@@ -684,14 +801,29 @@ impl Scene {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
             return Err(SceneError::InvalidOpacity { opacity });
         }
-        if self.require_node(node)?.opacity == Some(opacity) {
+        let retained = self.require_node(node)?.opacity;
+        if retained == Some(opacity) {
             return Ok(());
         }
+        let sent = self
+            .deferred
+            .get(&node)
+            .and_then(|deferred| deferred.opacity)
+            .or(retained);
         self.nodes
             .get_mut(&node)
             .map(Arc::make_mut)
             .expect("node checked above")
             .opacity = Some(opacity);
+        if let Some(sent) =
+            sent.filter(|sent| !self.needs_snapshot && opacity_visually_equal(*sent, opacity))
+        {
+            let deferred = self.deferred.entry(node).or_default();
+            deferred.opacity = Some(sent);
+            deferred.touched = true;
+            return Ok(());
+        }
+        self.clear_deferred_opacity(node);
         self.journal.push_coalesced(
             DirtySlot::Opacity(node),
             Operation::SetOpacity { node, opacity },
@@ -1016,6 +1148,12 @@ impl Scene {
     ) -> Result<Option<&FramePacket>, SceneError> {
         if self.pending.is_some() {
             return Err(SceneError::FramePending);
+        }
+        if self.needs_snapshot {
+            // A snapshot carries every retained value exactly.
+            self.deferred.clear();
+        } else {
+            self.settle_deferred();
         }
         if !self.needs_snapshot && self.journal.operations.is_empty() {
             return Ok(None);
@@ -1753,6 +1891,124 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn translate(x: f32, y: f32) -> Transform {
+        let mut transform = Transform::IDENTITY;
+        transform.0[12] = x;
+        transform.0[13] = y;
+        transform
+    }
+
+    #[test]
+    fn sub_pixel_motion_is_held_back_and_sent_exactly_once_it_stops() {
+        let (mut scene, mut renderer, _, child) = initialized_scene();
+        scene
+            .set_transform(child, translate(0.0, 10.0))
+            .expect("start");
+        scene.set_opacity(child, 0.5).expect("start opacity");
+        present_and_accept(&mut scene, &mut renderer);
+
+        // A slow drift: each frame moves less than a quarter pixel from what the Host shows.
+        scene
+            .set_transform(child, translate(0.0, 10.1))
+            .expect("drift");
+        scene.set_opacity(child, 0.5005).expect("fade");
+        assert!(scene.prepare_frame(1).expect("prepare").is_none());
+        assert!(scene.has_deferred_presentation());
+        assert_eq!(
+            scene.node(child).expect("child").transform(),
+            Some(translate(0.0, 10.1))
+        );
+
+        scene
+            .set_transform(child, translate(0.0, 10.2))
+            .expect("drift");
+        assert!(scene.prepare_frame(1).expect("prepare").is_none());
+
+        // Crossing the threshold against the last sent value sends the exact value, and the
+        // opacity that stopped changing is now sent exactly as well.
+        scene
+            .set_transform(child, translate(0.0, 10.3))
+            .expect("drift");
+        let packet = present_and_accept(&mut scene, &mut renderer);
+        assert_eq!(
+            packet.operations,
+            vec![
+                Operation::SetTransform {
+                    node: child,
+                    transform: translate(0.0, 10.3)
+                },
+                Operation::SetOpacity {
+                    node: child,
+                    opacity: 0.5005
+                },
+            ]
+        );
+
+        // The motion ends just off the sent pose: the next frame sends the exact value.
+        scene
+            .set_transform(child, translate(0.0, 10.4))
+            .expect("final pose");
+        assert!(scene.prepare_frame(1).expect("prepare").is_none());
+        let packet = present_and_accept(&mut scene, &mut renderer);
+        assert_eq!(
+            packet.operations,
+            vec![Operation::SetTransform {
+                node: child,
+                transform: translate(0.0, 10.4)
+            }]
+        );
+        assert!(!scene.has_deferred_presentation());
+        assert!(scene.prepare_frame(1).expect("prepare").is_none());
+    }
+
+    #[test]
+    fn visible_changes_and_snapshots_are_never_held_back() {
+        let (mut scene, mut renderer, _, child) = initialized_scene();
+        scene
+            .set_transform(child, translate(0.0, 0.0))
+            .expect("start");
+        present_and_accept(&mut scene, &mut renderer);
+
+        let mut scaled = translate(0.0, 0.0);
+        scaled.0[0] = 1.01;
+        scene.set_transform(child, scaled).expect("scale");
+        let packet = present_and_accept(&mut scene, &mut renderer);
+        assert_eq!(
+            packet.operations,
+            vec![Operation::SetTransform {
+                node: child,
+                transform: scaled
+            }]
+        );
+
+        scene.set_opacity(child, 1.0).expect("opaque");
+        present_and_accept(&mut scene, &mut renderer);
+        scene.set_opacity(child, 0.0001).expect("start fading");
+        // 0.0001 still rounds to full transparency in 8 bits, but becoming visible is not held back.
+        scene.set_opacity(child, 0.0).expect("hidden");
+        present_and_accept(&mut scene, &mut renderer);
+        scene.set_opacity(child, 0.001).expect("barely visible");
+        let packet = present_and_accept(&mut scene, &mut renderer);
+        assert_eq!(
+            packet.operations,
+            vec![Operation::SetOpacity {
+                node: child,
+                opacity: 0.001
+            }]
+        );
+
+        scene
+            .set_transform(child, translate(0.0, 0.1))
+            .expect("drift");
+        scene.require_snapshot().expect("recover");
+        let packet = present_and_accept(&mut scene, &mut renderer);
+        assert!(packet.operations.contains(&Operation::SetTransform {
+            node: child,
+            transform: translate(0.0, 0.1)
+        }));
+        assert!(!scene.has_deferred_presentation());
     }
 
     #[test]

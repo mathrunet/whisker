@@ -38,6 +38,8 @@ import rs.whisker.runtime.resource.HostResourceChannel
 import rs.whisker.runtime.resource.HostRasterSource
 import rs.whisker.runtime.resource.HostResourceService
 import rs.whisker.runtime.resource.HostResourceSnapshot
+import rs.whisker.runtime.scene.BackdropChange
+import rs.whisker.runtime.scene.BackdropDependency
 import rs.whisker.runtime.scene.BackdropRegistry
 import rs.whisker.runtime.scene.HostElementBootstrap
 import rs.whisker.runtime.scene.HostNode
@@ -118,12 +120,24 @@ class WhiskerView(context: Context) :
     private var backdropCaptureTarget: HostNode? = null
     private var backdropCaptureReached = false
     private val backdropCaptureAncestors = ArrayList<View>()
-    private val backdropNodes = BackdropRegistry<HostNode, View> { node, target ->
-        var current: View? = target
-        while (current != null && current !== node) current = current.parent as? View
-        current === node
-    }
+    private val backdropNodes = BackdropRegistry<View>(
+        parentOf = { it.parent as? View },
+        drawsBefore = { parent, first, second ->
+            val group = parent as ViewGroup
+            val firstIndex = group.indexOfChild(first)
+            firstIndex >= 0 && firstIndex < group.indexOfChild(second)
+        },
+        paintsBefore = { parent, child ->
+            val node = parent as? HostNode
+            node == null || node.paintsBeforeChild(child)
+        },
+    )
     private var invalidatingBackdrops = false
+
+    // The node whose RenderNode properties are being set, and what kind they are. Android reports
+    // a property change through onDescendantInvalidated synchronously from inside the setter.
+    private var propertyChangeSource: View? = null
+    private var propertyChangeKind = BackdropChange.Content
     private val pendingContinuousEvents = PendingContinuousEvents()
     private var continuousEventFlushPending = false
     private val pendingModuleEvents = PendingModuleEvents()
@@ -220,14 +234,58 @@ class WhiskerView(context: Context) :
         backdropNodes.update(node, active)
     }
 
+    /**
+     * Marks the following setter calls as changing only RenderNode properties of [node], so
+     * backdrops below it can keep their recordings when nothing [node] paints before them is part
+     * of one. Returns false (and marks nothing) when another change is already being marked; only
+     * a true result must be paired with [endBackdropPropertyChange].
+     */
+    internal fun beginBackdropPropertyChange(node: View, kind: BackdropChange): Boolean {
+        if (propertyChangeSource != null) return false
+        propertyChangeSource = node
+        propertyChangeKind = kind
+        return true
+    }
+
+    internal fun endBackdropPropertyChange() {
+        propertyChangeSource = null
+        propertyChangeKind = BackdropChange.Content
+    }
+
     // Property-only changes (an ancestor's translation during a route transition) and repaints of
     // the content beneath do not re-record a backdrop node, so its baked offset and snapshot go stale.
     override fun onDescendantInvalidated(child: View, target: View) {
         super.onDescendantInvalidated(child, target)
+        val change = if (target === propertyChangeSource) propertyChangeKind else BackdropChange.Content
+        invalidateBackdropCaptures(target, change)
+    }
+
+    // A child added to or removed from the root changes what a backdrop recording references, and
+    // the root does not report its own invalidation as a descendant one.
+    override fun onViewAdded(child: View) {
+        super.onViewAdded(child)
+        invalidateBackdropCaptures(this)
+    }
+
+    override fun onViewRemoved(child: View) {
+        super.onViewRemoved(child)
+        invalidateBackdropCaptures(this)
+    }
+
+    private fun invalidateBackdropCaptures(
+        target: View,
+        change: BackdropChange = BackdropChange.Content,
+    ) {
         if (invalidatingBackdrops || backdropCaptureTarget != null || backdropNodes.isEmpty) return
         invalidatingBackdrops = true
         try {
-            backdropNodes.affectedBy(target).forEach(View::invalidate)
+            backdropNodes.forEachAffectedBy(target, change) { node, dependency ->
+                when (dependency) {
+                    BackdropDependency.Recapture -> (node as HostNode).invalidateBackdropCapture()
+                    BackdropDependency.Reposition -> (node as HostNode).repositionBackdrop()
+                    BackdropDependency.Redraw -> node.invalidate()
+                }
+            }
         } finally {
             invalidatingBackdrops = false
         }
@@ -262,6 +320,7 @@ class WhiskerView(context: Context) :
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
+        invalidateBackdropCaptures(this)
         mountWhenSized()
         requestFrameFromNative()
     }
