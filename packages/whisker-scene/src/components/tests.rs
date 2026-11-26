@@ -180,6 +180,35 @@ fn the_active_camera_clears_when_it_unmounts() {
     assert!(scene.active_camera().is_none());
 }
 
+#[test]
+fn an_orthographic_camera_projects_its_height() {
+    let scene = Scene::new();
+    let shown = scene.clone();
+    mounted(
+        move || {
+            render! {
+                SceneView(style: Css::new(), scene: shown) {
+                    PerspectiveCamera(active: false)
+                    OrthographicCamera(height: 4.0, position: Vec3::new(0.0, 3.0, 0.1))
+                }
+            }
+        },
+        |_| {
+            let camera: Node = scene.active_camera().expect("camera is active");
+            assert_eq!(
+                camera.camera(),
+                Some(Projection::Orthographic {
+                    height: 4.0,
+                    near: 0.1,
+                    far: 1000.0,
+                })
+            );
+            assert_eq!(camera.transform().translation, Vec3::new(0.0, 3.0, 0.1));
+        },
+    );
+    assert!(scene.active_camera().is_none());
+}
+
 #[component]
 fn spinner(calls: Rc<Cell<u32>>) -> Element {
     let calls = calls.clone();
@@ -211,4 +240,28 @@ fn use_frame_runs_until_unmount() {
     );
     scene.inner().run_frame_callbacks(&frame);
     assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn scene_content_mounts_nodes_without_a_view() {
+    let scene = Scene::new();
+    let shown = scene.clone();
+    mounted(
+        move || {
+            render! {
+                SceneContent(scene: shown) {
+                    Group(position: Vec3::X) {
+                        Mesh(geometry: cube(), material: red())
+                    }
+                }
+            }
+        },
+        |_| {
+            let top = scene.root().children();
+            assert_eq!(top.len(), 1);
+            assert_eq!(top[0].transform().translation, Vec3::X);
+            assert!(top[0].children()[0].mesh().is_some());
+        },
+    );
+    assert!(scene.root().children().is_empty());
 }

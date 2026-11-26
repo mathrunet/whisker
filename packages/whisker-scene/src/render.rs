@@ -1,389 +1,48 @@
 //! A forward renderer that draws one [`Scene`] into one surface.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+mod collect;
+mod pipeline;
+mod post;
+mod resources;
+mod shadow;
+mod visibility;
 
-use glam::{Mat4, Vec3, Vec4};
+use std::rc::Rc;
+use std::time::Duration;
+
+use glam::{Mat4, Vec2, Vec3, Vec4};
+use whisker::css::Color;
 use whisker_surface::{FrameInfo, SurfaceSize};
-use whisker_wgpu::{Gpu, Renderer, wgpu};
+use whisker_wgpu::{Gpu, Layer, LayerHost, LayerTarget, Renderer, wgpu};
+
+use crate::raycast::{dispatch_tap, ray_through};
+
+pub(crate) use collect::{Collected, Draw, camera_for, collect, within_distance};
+pub(crate) use pipeline::{material_source, translucent};
+pub(crate) use resources::{DeformBuffer, GpuMesh, GpuTexture, InstanceBuffer};
 
 use crate::core::{
-    Geometry, Light, Material, Node, Projection, Scene, Texture, Transform, linear_rgba, srgb_rgba,
+    CUBE_LEVELS, DrawHook, Environment, Fog, Scene, SceneInner, linear_rgba, srgb_rgba,
 };
+use collect::radiance;
+use pipeline::{
+    DirectionalUniform, DrawUniform, FrameUniform, PipelineKey, PointUniform, Shared, double_sided,
+    draw_buffer, draw_uniform, masked, shared, transmissive,
+};
+use post::PostTargets;
+use resources::{MaterialCache, bind_mesh, environment_cube};
+use shadow::{Eye, MAX_SHADOW_LAYERS, ShadowMaps, ShadowPlan};
+use visibility::{Frustum, Ordered, draw_order};
 
 const MAX_DIRECTIONAL: usize = 4;
-const MAX_POINT: usize = 16;
+const MAX_POINT: usize = 256;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const MSAA_SAMPLES: u32 = 4;
 
-pub(crate) struct GpuMesh {
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    count: u32,
-}
-
-pub(crate) struct GpuTexture {
-    bind_group: wgpu::BindGroup,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct FrameUniform {
-    view_proj: [[f32; 4]; 4],
-    camera_position: [f32; 4],
-    ambient: [f32; 4],
-    counts: [u32; 4],
-    directional: [[[f32; 4]; 2]; MAX_DIRECTIONAL],
-    point: [[[f32; 4]; 2]; MAX_POINT],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct DrawUniform {
-    model: [[f32; 4]; 4],
-    normal: [[f32; 4]; 4],
-    base_color: [f32; 4],
-    emissive: [f32; 4],
-    params: [f32; 4],
-}
-
-/// Device-wide objects shared by every scene surface.
-struct Shared {
-    frame_layout: wgpu::BindGroupLayout,
-    draw_layout: wgpu::BindGroupLayout,
-    texture_layout: wgpu::BindGroupLayout,
-    pipeline_layout: wgpu::PipelineLayout,
-    shader: wgpu::ShaderModule,
-    sampler: wgpu::Sampler,
-    white: GpuTexture,
-    pipelines: RefCell<HashMap<(wgpu::TextureFormat, u32, bool), wgpu::RenderPipeline>>,
-}
-
-thread_local! {
-    static SHARED: RefCell<Option<Rc<Shared>>> = const { RefCell::new(None) };
-}
-
-fn shared(gpu: &Gpu) -> Rc<Shared> {
-    SHARED.with_borrow_mut(|shared| {
-        shared
-            .get_or_insert_with(|| Rc::new(Shared::new(gpu)))
-            .clone()
-    })
-}
-
-impl Shared {
-    fn new(gpu: &Gpu) -> Shared {
-        let device = &gpu.device;
-        let uniform = |dynamic: bool, size: usize| wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: dynamic,
-                min_binding_size: wgpu::BufferSize::new(size as u64),
-            },
-            count: None,
-        };
-        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("whisker-scene frame"),
-            entries: &[uniform(false, size_of::<FrameUniform>())],
-        });
-        let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("whisker-scene draw"),
-            entries: &[uniform(true, size_of::<DrawUniform>())],
-        });
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("whisker-scene texture"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("whisker-scene"),
-            bind_group_layouts: &[
-                Some(&frame_layout),
-                Some(&draw_layout),
-                Some(&texture_layout),
-            ],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("whisker-scene"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("whisker-scene"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let white = upload_texture(gpu, &texture_layout, &sampler, 1, 1, &[255; 4]);
-        Shared {
-            frame_layout,
-            draw_layout,
-            texture_layout,
-            pipeline_layout,
-            shader,
-            sampler,
-            white,
-            pipelines: RefCell::new(HashMap::new()),
-        }
-    }
-
-    fn pipeline(
-        &self,
-        gpu: &Gpu,
-        format: wgpu::TextureFormat,
-        samples: u32,
-        blend: bool,
-    ) -> wgpu::RenderPipeline {
-        self.pipelines
-            .borrow_mut()
-            .entry((format, samples, blend))
-            .or_insert_with(|| {
-                gpu.device
-                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("whisker-scene"),
-                        layout: Some(&self.pipeline_layout),
-                        vertex: wgpu::VertexState {
-                            module: &self.shader,
-                            entry_point: Some("vs"),
-                            compilation_options: Default::default(),
-                            buffers: &[Some(wgpu::VertexBufferLayout {
-                                array_stride: size_of::<crate::core::Vertex>() as u64,
-                                step_mode: wgpu::VertexStepMode::Vertex,
-                                attributes: &wgpu::vertex_attr_array![
-                                    0 => Float32x3,
-                                    1 => Float32x3,
-                                    2 => Float32x2,
-                                ],
-                            })],
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &self.shader,
-                            entry_point: Some("fs"),
-                            compilation_options: Default::default(),
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format,
-                                blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
-                                write_mask: wgpu::ColorWrites::ALL,
-                            })],
-                        }),
-                        primitive: wgpu::PrimitiveState {
-                            cull_mode: Some(wgpu::Face::Back),
-                            ..Default::default()
-                        },
-                        depth_stencil: Some(wgpu::DepthStencilState {
-                            format: DEPTH_FORMAT,
-                            depth_write_enabled: Some(!blend),
-                            depth_compare: Some(wgpu::CompareFunction::Less),
-                            stencil: Default::default(),
-                            bias: Default::default(),
-                        }),
-                        multisample: wgpu::MultisampleState {
-                            count: samples,
-                            ..Default::default()
-                        },
-                        multiview_mask: None,
-                        cache: None,
-                    })
-            })
-            .clone()
-    }
-}
-
-fn upload_texture(
-    gpu: &Gpu,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> GpuTexture {
-    let size = wgpu::Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("whisker-scene texture"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        size,
-    );
-    let view = texture.create_view(&Default::default());
-    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("whisker-scene texture"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    GpuTexture { bind_group }
-}
-
-fn mesh<'a>(gpu: &Gpu, geometry: &'a Geometry) -> &'a GpuMesh {
-    let data = geometry.data();
-    data.gpu.get_or_init(|| {
-        let buffer = |label, contents: &[u8], usage| {
-            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: (contents.len() as u64)
-                    .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
-                    .max(4),
-                usage: usage | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let mut padded = contents.to_vec();
-            padded.resize(buffer.size() as usize, 0);
-            gpu.queue.write_buffer(&buffer, 0, &padded);
-            buffer
-        };
-        GpuMesh {
-            vertices: buffer(
-                "whisker-scene vertices",
-                bytemuck::cast_slice(&data.vertices),
-                wgpu::BufferUsages::VERTEX,
-            ),
-            indices: buffer(
-                "whisker-scene indices",
-                bytemuck::cast_slice(&data.indices),
-                wgpu::BufferUsages::INDEX,
-            ),
-            count: data.indices.len() as u32,
-        }
-    })
-}
-
-fn texture<'a>(gpu: &Gpu, shared: &'a Shared, texture: Option<&'a Texture>) -> &'a GpuTexture {
-    let Some(texture) = texture else {
-        return &shared.white;
-    };
-    let data = texture.data();
-    data.gpu.get_or_init(|| {
-        upload_texture(
-            gpu,
-            &shared.texture_layout,
-            &shared.sampler,
-            data.width,
-            data.height,
-            &data.pixels,
-        )
-    })
-}
-
-/// What one frame draws, gathered from the node tree.
-#[derive(Default)]
-pub(crate) struct Collected {
-    pub(crate) draws: Vec<(Mat4, Geometry, Material)>,
-    pub(crate) directional: Vec<(Vec3, [f32; 4])>,
-    pub(crate) point: Vec<(Vec3, f32, [f32; 4])>,
-    pub(crate) cameras: Vec<(Node, Mat4, Projection)>,
-}
-
-pub(crate) fn collect(root: &Node) -> Collected {
-    let mut collected = Collected::default();
-    visit(root, Mat4::IDENTITY, &mut collected);
-    collected
-}
-
-fn visit(node: &Node, parent: Mat4, out: &mut Collected) {
-    if !node.visible() {
-        return;
-    }
-    let world = parent * node.transform().to_matrix();
-    if let Some((geometry, material)) = node.mesh() {
-        out.draws.push((world, geometry, material));
-    }
-    match node.light() {
-        Some(Light::Directional { color, intensity }) => {
-            let toward = -world.transform_vector3(Vec3::NEG_Z).normalize_or(Vec3::Y);
-            out.directional.push((toward, radiance(color, intensity)));
-        }
-        Some(Light::Point {
-            color,
-            intensity,
-            range,
-        }) => {
-            out.point.push((
-                world.transform_point3(Vec3::ZERO),
-                range,
-                radiance(color, intensity),
-            ));
-        }
-        None => {}
-    }
-    if let Some(projection) = node.camera() {
-        out.cameras.push((node.clone(), world, projection));
-    }
-    for child in node.children() {
-        visit(&child, world, out);
-    }
-}
-
-fn radiance(color: whisker::css::Color, intensity: f32) -> [f32; 4] {
-    let [r, g, b, _] = linear_rgba(color);
-    [r * intensity, g * intensity, b * intensity, 0.0]
-}
-
-fn default_camera() -> (Mat4, Projection) {
-    let transform = Transform::looking_at(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
-    (
-        transform.to_matrix(),
-        Projection::Perspective {
-            fov_y: 60f32.to_radians(),
-            near: 0.1,
-            far: 1000.0,
-        },
-    )
-}
-
 struct Attachments {
     size: (u32, u32),
+    format: wgpu::TextureFormat,
+    samples: u32,
     depth: wgpu::TextureView,
     msaa: Option<wgpu::TextureView>,
 }
@@ -394,7 +53,10 @@ pub(crate) struct SceneRenderer {
     format: wgpu::TextureFormat,
     samples: u32,
     encode_srgb: bool,
+    /// Two frame uniforms: the frame's own, then the same writing linear color, for the scene
+    /// transmissive surfaces show through.
     frame_buffer: wgpu::Buffer,
+    frame_stride: u64,
     frame_bind_group: wgpu::BindGroup,
     draw_buffer: wgpu::Buffer,
     draw_bind_group: wgpu::BindGroup,
@@ -402,7 +64,25 @@ pub(crate) struct SceneRenderer {
     draw_capacity: u64,
     staging: Vec<u8>,
     size: (u32, u32),
-    attachments: Option<Attachments>,
+    scale: f32,
+    attachments: Option<Rc<Attachments>>,
+    materials: MaterialCache,
+    shadow_maps: Rc<ShadowMaps>,
+    shadow_view_buffer: wgpu::Buffer,
+    shadow_view_bind_group: wgpu::BindGroup,
+    shadow_view_stride: u64,
+    bound_environment: Option<Environment>,
+    post: Option<Rc<PostTargets>>,
+    transmission: Option<Rc<TransmissionTarget>>,
+    time: f32,
+    started: Option<Duration>,
+    /// Point and spot lights, one row of four texels each.
+    light_texture: wgpu::Texture,
+    light_view: wgpu::TextureView,
+    pub(crate) on_draw: Option<DrawHook>,
+    /// Layers keep their own shadow maps: a host prepares every layer before submitting any, so a
+    /// pooled map would be overwritten by the next layer before this one draws.
+    pooled_shadows: bool,
 }
 
 impl SceneRenderer {
@@ -419,23 +99,62 @@ impl SceneRenderer {
         } else {
             1
         };
+        let alignment = u64::from(gpu.device.limits().min_uniform_buffer_offset_alignment);
+        let frame_stride = (size_of::<FrameUniform>() as u64).next_multiple_of(alignment);
         let frame_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("whisker-scene frame"),
-            size: size_of::<FrameUniform>() as u64,
+            size: frame_stride * 2,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let frame_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("whisker-scene frame"),
-            layout: &shared.frame_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buffer.as_entire_binding(),
-            }],
+        let shadow_maps = shared
+            .shadow_maps
+            .get(|maps| maps.size == 1, || ShadowMaps::new(gpu, 1, 1));
+        let light_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("whisker-scene lights"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: MAX_POINT as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
-        let alignment = u64::from(gpu.device.limits().min_uniform_buffer_offset_alignment);
+        let light_view = light_texture.create_view(&Default::default());
+        let frame_bind_group = frame_bind_group(
+            gpu,
+            &shared,
+            &frame_buffer,
+            &shadow_maps,
+            &shared.no_environment,
+            &light_view,
+        );
         let draw_stride = (size_of::<DrawUniform>() as u64).next_multiple_of(alignment);
         let (draw_buffer, draw_bind_group) = draw_buffer(gpu, &shared, draw_stride, 16);
+        let shadow_view_stride = (size_of::<Mat4>() as u64).next_multiple_of(alignment);
+        let shadow_view_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("whisker-scene shadow views"),
+            // One slot past the shadow layers holds the camera, for the depth prepass.
+            size: shadow_view_stride * (MAX_SHADOW_LAYERS as u64 + 1),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shadow_view_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("whisker-scene shadow views"),
+            layout: &shared.shadow_view_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &shadow_view_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size_of::<Mat4>() as u64),
+                }),
+            }],
+        });
         SceneRenderer {
             scene,
             shared,
@@ -443,6 +162,7 @@ impl SceneRenderer {
             samples,
             encode_srgb: !format.is_srgb(),
             frame_buffer,
+            frame_stride,
             frame_bind_group,
             draw_buffer,
             draw_bind_group,
@@ -450,175 +170,504 @@ impl SceneRenderer {
             draw_capacity: 16,
             staging: Vec::new(),
             size: (1, 1),
+            scale: 1.0,
             attachments: None,
+            materials: MaterialCache::default(),
+            shadow_maps,
+            shadow_view_buffer,
+            shadow_view_bind_group,
+            shadow_view_stride,
+            bound_environment: None,
+            post: None,
+            transmission: None,
+            time: 0.0,
+            started: None,
+            light_texture,
+            light_view,
+            on_draw: None,
+            pooled_shadows: true,
         }
     }
 
-    fn prepare_attachments(&mut self, gpu: &Gpu) {
+    /// Rebuilds the frame bind group when the shadow maps or the environment it binds change.
+    fn prepare_frame_bindings(
+        &mut self,
+        gpu: &Gpu,
+        plan: &ShadowPlan,
+        environment: Option<&Environment>,
+    ) {
+        let maps_fit = self.shadow_maps.fits(plan);
+        if maps_fit && self.bound_environment.as_ref() == environment {
+            return;
+        }
+        if !maps_fit {
+            let make = || ShadowMaps::new(gpu, plan.size, plan.layers.len());
+            self.shadow_maps = if self.pooled_shadows {
+                self.shared.shadow_maps.get(|maps| maps.fits(plan), make)
+            } else {
+                Rc::new(make())
+            };
+        }
+        self.bound_environment = environment.cloned();
+        let cube = match environment {
+            Some(environment) => environment_cube(gpu, environment),
+            None => &self.shared.no_environment,
+        };
+        self.frame_bind_group = frame_bind_group(
+            gpu,
+            &self.shared,
+            &self.frame_buffer,
+            &self.shadow_maps,
+            cube,
+            &self.light_view,
+        );
+    }
+
+    /// The depth and multisampled color attachments for a `format` target, made anew on change.
+    fn prepare_attachments(
+        &mut self,
+        gpu: &Gpu,
+        format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> (wgpu::TextureView, Option<wgpu::TextureView>) {
         if self
             .attachments
             .as_ref()
-            .is_some_and(|a| a.size != self.size)
+            .is_some_and(|a| a.size != self.size || a.format != format || a.samples != samples)
         {
             self.attachments = None;
         }
-        let (width, height) = self.size;
-        let (format, samples) = (self.format, self.samples);
-        self.attachments.get_or_insert_with(|| {
-            let texture = |label, format| {
-                gpu.device
-                    .create_texture(&wgpu::TextureDescriptor {
-                        label: Some(label),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: samples,
-                        dimension: wgpu::TextureDimension::D2,
+        let size = self.size;
+        let (width, height) = size;
+        let shared = self.shared.clone();
+        let attachments = self.attachments.get_or_insert_with(|| {
+            shared.attachments.get(
+                |a| a.size == size && a.format == format && a.samples == samples,
+                || {
+                    let texture = |label, format| {
+                        gpu.device
+                            .create_texture(&wgpu::TextureDescriptor {
+                                label: Some(label),
+                                size: wgpu::Extent3d {
+                                    width,
+                                    height,
+                                    depth_or_array_layers: 1,
+                                },
+                                mip_level_count: 1,
+                                sample_count: samples,
+                                dimension: wgpu::TextureDimension::D2,
+                                format,
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                                view_formats: &[],
+                            })
+                            .create_view(&Default::default())
+                    };
+                    Attachments {
+                        size,
                         format,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    })
-                    .create_view(&Default::default())
-            };
-            Attachments {
-                size: (width, height),
-                depth: texture("whisker-scene depth", DEPTH_FORMAT),
-                msaa: (samples > 1).then(|| texture("whisker-scene msaa", format)),
-            }
+                        samples,
+                        depth: texture("whisker-scene depth", DEPTH_FORMAT),
+                        msaa: (samples > 1).then(|| texture("whisker-scene msaa", format)),
+                    }
+                },
+            )
         });
+        (attachments.depth.clone(), attachments.msaa.clone())
     }
-}
-
-fn draw_buffer(
-    gpu: &Gpu,
-    shared: &Shared,
-    stride: u64,
-    capacity: u64,
-) -> (wgpu::Buffer, wgpu::BindGroup) {
-    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("whisker-scene draws"),
-        size: stride * capacity,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("whisker-scene draws"),
-        layout: &shared.draw_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &buffer,
-                offset: 0,
-                size: wgpu::BufferSize::new(size_of::<DrawUniform>() as u64),
-            }),
-        }],
-    });
-    (buffer, bind_group)
-}
-
-fn draw_uniform(model: Mat4, material: &Material) -> DrawUniform {
-    let normal = model.inverse().transpose();
-    let (base_color, emissive, params) = match material {
-        Material::Unlit { color } => (linear_rgba(*color), [0.0; 4], [0.0, 1.0, 1.0, 0.0]),
-        Material::Standard(standard) => (
-            linear_rgba(standard.base_color),
-            linear_rgba(standard.emissive),
-            [standard.metallic, standard.roughness, 0.0, 0.0],
-        ),
-    };
-    DrawUniform {
-        model: model.to_cols_array_2d(),
-        normal: normal.to_cols_array_2d(),
-        base_color,
-        emissive,
-        params,
-    }
-}
-
-fn base_texture(material: &Material) -> Option<&Texture> {
-    match material {
-        Material::Unlit { .. } => None,
-        Material::Standard(standard) => standard.base_color_texture.as_ref(),
-    }
-}
-
-fn translucent(material: &Material) -> bool {
-    let color = match material {
-        Material::Unlit { color } => *color,
-        Material::Standard(standard) => standard.base_color,
-    };
-    srgb_rgba(color)[3] < 1.0
 }
 
 impl Renderer for SceneRenderer {
     fn resize(&mut self, _gpu: &Gpu, size: SurfaceSize) {
         self.size = (size.width.max(1), size.height.max(1));
+        self.scale = if size.scale > 0.0 { size.scale } else { 1.0 };
     }
 
     fn render(&mut self, gpu: &Gpu, target: &wgpu::TextureView, frame: FrameInfo) {
         let scene = self.scene.clone();
         let inner = scene.inner();
         inner.run_frame_callbacks(&frame);
-        let collected = collect(inner.root());
-
-        let active = inner.active_camera();
-        let (camera_world, projection) = collected
-            .cameras
-            .iter()
-            .find(|(node, _, _)| Some(node) == active.as_ref())
-            .or(collected.cameras.first())
-            .map(|(_, world, projection)| (*world, *projection))
-            .unwrap_or_else(default_camera);
+        let (camera_world, projection) = camera_for(&scene);
         let aspect = self.size.0 as f32 / self.size.1 as f32;
-        let view = camera_world.inverse();
-        let view_proj = projection.to_matrix(aspect) * view;
-        let camera_position = camera_world.transform_point3(Vec3::ZERO);
+        let eye = Eye {
+            world: camera_world,
+            projection: projection.to_matrix(aspect),
+        };
+        let FramePlan {
+            collected,
+            plan,
+            order,
+            view_proj,
+        } = self.plan_frame(gpu, inner, eye, true);
+        let environment = inner.environment();
+        let sky = environment.is_some() && inner.environment_background();
+        let settings = inner.post_processing();
+        if !settings.active() {
+            self.post = None;
+        } else if self
+            .post
+            .as_ref()
+            .is_none_or(|post| post.size() != self.size)
+        {
+            let size = self.size;
+            self.post = Some(
+                self.shared
+                    .post_targets
+                    .get(|post| post.size() == size, || PostTargets::new(gpu, size)),
+            );
+        }
+        let transmits = order
+            .iter()
+            .any(|ordered| transmissive(&collected.draws[ordered.index].material));
+        if !transmits {
+            self.transmission = None;
+        } else if self
+            .transmission
+            .as_ref()
+            .is_none_or(|target| target.size != self.size)
+        {
+            let size = self.size;
+            self.transmission = Some(self.shared.transmission_targets.get(
+                |target| target.size == size,
+                || TransmissionTarget::new(gpu, &self.shared, size),
+            ));
+        }
+        self.write_frame(gpu, frame, inner, &collected, &plan, view_proj, eye);
 
+        let clear = self.clear_color(inner.background());
+        let backdrop = Backdrop {
+            clear,
+            sky,
+            frame_offset: 0,
+            transmission: self
+                .transmission
+                .as_ref()
+                .map_or(&self.shared.no_transmission, |target| &target.bind_group)
+                .clone(),
+        };
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("whisker-scene"),
+            });
+        self.encode_shadows(gpu, &mut encoder, &collected.draws, &plan);
+        if let Some(behind) = &self.transmission {
+            let opaque: Vec<Ordered> = order
+                .iter()
+                .copied()
+                .filter(|ordered| !ordered.blended)
+                .collect();
+            let (view, depth, format) = (behind.view.clone(), behind.depth.clone(), behind.format);
+            let source = Target {
+                view: &view,
+                format,
+                samples: 1,
+                depth: &depth,
+                msaa: None,
+            };
+            let raw = Backdrop {
+                clear: linear_clear(inner.background()),
+                sky,
+                frame_offset: self.frame_stride as u32,
+                transmission: self.shared.no_transmission.clone(),
+            };
+            self.encode_forward(gpu, &mut encoder, source, &collected.draws, &opaque, raw);
+        }
+        match self
+            .post
+            .as_ref()
+            .map(|post| (post.scene.clone(), post.format, post.samples))
+        {
+            None => {
+                let (depth, msaa) = self.prepare_attachments(gpu, self.format, self.samples);
+                let target = Target {
+                    view: target,
+                    format: self.format,
+                    samples: self.samples,
+                    depth: &depth,
+                    msaa: msaa.as_ref(),
+                };
+                self.encode_forward(
+                    gpu,
+                    &mut encoder,
+                    target,
+                    &collected.draws,
+                    &order,
+                    backdrop,
+                );
+            }
+            Some((scene_view, format, samples)) => {
+                let (depth, msaa) = self.prepare_attachments(gpu, format, samples);
+                let scene_target = Target {
+                    view: &scene_view,
+                    format,
+                    samples,
+                    depth: &depth,
+                    msaa: msaa.as_ref(),
+                };
+                self.encode_forward(
+                    gpu,
+                    &mut encoder,
+                    scene_target,
+                    &collected.draws,
+                    &order,
+                    backdrop,
+                );
+                if settings.ambient_occlusion.is_some() || settings.depth_of_field.is_some() {
+                    self.encode_depth_prepass(
+                        gpu,
+                        &mut encoder,
+                        &collected.draws,
+                        &order,
+                        view_proj,
+                    );
+                }
+                self.encode_post(
+                    gpu,
+                    &mut encoder,
+                    target,
+                    &settings,
+                    eye.projection,
+                    inner.tone_mapping(),
+                );
+            }
+        }
+        gpu.queue.submit([encoder.finish()]);
+        self.materials.sweep();
+    }
+}
+
+/// What a frame draws and how, shared by surface frames and layer frames.
+struct FramePlan {
+    collected: Collected,
+    plan: ShadowPlan,
+    order: Vec<Ordered>,
+    view_proj: Mat4,
+}
+
+impl SceneRenderer {
+    /// Collects the scene as seen from `eye`, plans its shadows and binds what they need.
+    ///
+    /// `reach_within_far` keeps shadows inside the eye's far plane, which a host's far plane may
+    /// hug the ground too tightly for.
+    fn plan_frame(
+        &mut self,
+        gpu: &Gpu,
+        inner: &SceneInner,
+        eye: Eye,
+        reach_within_far: bool,
+    ) -> FramePlan {
+        let view = eye.world.inverse();
+        let view_proj = eye.projection * view;
+        let mut collected = collect(inner.root(), eye.world.transform_point3(Vec3::ZERO));
+        for draw in &collected.draws {
+            if let Some(deform) = &draw.deform {
+                deform.update(&draw.geometry);
+            }
+        }
+        if let Some(on_draw) = &self.on_draw {
+            on_draw(
+                view_proj,
+                Vec2::new(self.size.0 as f32, self.size.1 as f32) / self.scale,
+            );
+        }
+        let frustum = Frustum::new(view_proj);
+        collected
+            .point
+            .retain(|light| frustum.intersects_sphere(light.position, light.range));
+        collected.point.truncate(MAX_POINT);
+        let plan = shadow::plan(
+            &collected,
+            eye,
+            reach_within_far,
+            gpu.device.limits().max_texture_dimension_2d,
+        );
+        let environment = inner.environment();
+        self.prepare_frame_bindings(gpu, &plan, environment.as_ref().map(|(e, _)| e));
+        let order = draw_order(&collected.draws, view, &frustum);
+        FramePlan {
+            collected,
+            plan,
+            order,
+            view_proj,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_frame(
+        &mut self,
+        gpu: &Gpu,
+        frame: FrameInfo,
+        inner: &SceneInner,
+        collected: &Collected,
+        plan: &ShadowPlan,
+        view_proj: Mat4,
+        eye: Eye,
+    ) {
+        let started = *self.started.get_or_insert(frame.timestamp);
+        self.time = frame.timestamp.saturating_sub(started).as_secs_f32();
+        self.write_frame_uniform(gpu, collected, plan, view_proj, eye, inner);
+        self.write_draw_uniforms(gpu, &collected.draws);
+    }
+}
+
+impl SceneRenderer {
+    fn write_frame_uniform(
+        &self,
+        gpu: &Gpu,
+        collected: &Collected,
+        plan: &ShadowPlan,
+        view_proj: Mat4,
+        eye: Eye,
+        inner: &SceneInner,
+    ) {
         let (ambient_color, ambient_intensity) = inner.ambient();
+        let (sky, ground, hemisphere) = inner.hemisphere();
+        let (tone_mapping, exposure) = inner.tone_mapping();
+        let tone_mapping = post::tone_curve(tone_mapping);
+        let (fog_color, fog) = match inner.fog() {
+            None => (Color::rgb(0, 0, 0), [0.0; 4]),
+            Some(Fog::Linear { color, near, far }) => (color, [1.0, near, far, 0.0]),
+            Some(Fog::Exponential { color, density }) => (color, [2.0, density, 0.0, 0.0]),
+        };
+        let (environment, irradiance) = match inner.environment() {
+            Some((environment, intensity)) => {
+                let mut irradiance = [[0.0; 4]; 9];
+                for (slot, c) in irradiance
+                    .iter_mut()
+                    .zip(environment.data().baked().irradiance)
+                {
+                    *slot = (c * intensity).extend(0.0).to_array();
+                }
+                ([intensity, 1.0, (CUBE_LEVELS - 1) as f32, 0.0], irradiance)
+            }
+            None => ([0.0; 4], [[0.0; 4]; 9]),
+        };
         let mut uniform = FrameUniform {
             view_proj: view_proj.to_cols_array_2d(),
-            camera_position: camera_position.extend(1.0).to_array(),
+            inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
+            environment,
+            time: [
+                self.time,
+                f32::from(u8::from(self.transmission.is_some())),
+                0.0,
+                0.0,
+            ],
+            irradiance,
+            camera_position: eye
+                .world
+                .transform_point3(Vec3::ZERO)
+                .extend(1.0)
+                .to_array(),
+            camera_forward: eye
+                .world
+                .transform_vector3(Vec3::NEG_Z)
+                .normalize_or(Vec3::NEG_Z)
+                .extend(0.0)
+                .to_array(),
             ambient: radiance(ambient_color, ambient_intensity),
+            sky: radiance(sky, hemisphere),
+            ground: radiance(ground, hemisphere),
+            tone: [
+                exposure,
+                tone_mapping,
+                f32::from(u8::from(self.post.is_some())),
+                0.0,
+            ],
+            fog_color: linear_rgba(fog_color),
+            fog,
             counts: [
                 collected.directional.len().min(MAX_DIRECTIONAL) as u32,
-                collected.point.len().min(MAX_POINT) as u32,
+                collected.point.len() as u32,
                 u32::from(self.encode_srgb),
                 0,
             ],
-            directional: [[[0.0; 4]; 2]; MAX_DIRECTIONAL],
-            point: [[[0.0; 4]; 2]; MAX_POINT],
+            shadow: [1.0 / self.shadow_maps.size as f32, 0.0, 0.0, 0.0],
+            directional: [DirectionalUniform::default(); MAX_DIRECTIONAL],
+            shadow_matrices: [[[0.0; 4]; 4]; MAX_SHADOW_LAYERS],
         };
-        for (slot, (toward, color)) in uniform.directional.iter_mut().zip(&collected.directional) {
-            *slot = [toward.extend(0.0).to_array(), *color];
+        for (index, light) in collected
+            .directional
+            .iter()
+            .take(MAX_DIRECTIONAL)
+            .enumerate()
+        {
+            let cascades = plan.directional.get(index).and_then(Option::as_ref);
+            uniform.directional[index] = DirectionalUniform {
+                direction: light.toward.extend(0.0).to_array(),
+                color: light.radiance,
+                shadow: cascades.map_or([-1.0, 0.0, 0.0, 0.0], |c| {
+                    [
+                        c.first as f32,
+                        c.count as f32,
+                        c.shadow.bias,
+                        c.shadow.softness,
+                    ]
+                }),
+                splits: cascades.map_or([0.0; 4], |c| c.splits),
+                texel: cascades.map_or([0.0; 4], |c| c.texel),
+            };
         }
-        for (slot, (position, range, color)) in uniform.point.iter_mut().zip(&collected.point) {
-            *slot = [position.extend(*range).to_array(), *color];
+        let mut points = Vec::with_capacity(collected.point.len());
+        for (index, light) in collected.point.iter().enumerate() {
+            let faces = plan.point.get(index).and_then(Option::as_ref);
+            let (direction, scale, offset) = match light.cone {
+                Some(cone) => {
+                    let (inner, outer) = (cone.inner_angle.cos(), cone.outer_angle.cos());
+                    let scale = 1.0 / (inner - outer).max(1e-4);
+                    (cone.direction, scale, -outer * scale)
+                }
+                None => (Vec3::ZERO, 0.0, 1.0),
+            };
+            let [r, g, b, _] = light.radiance;
+            points.push(PointUniform {
+                position: light.position.extend(light.range).to_array(),
+                color: [r, g, b, offset],
+                shadow: faces.map_or([-1.0, 0.0, 0.0, 0.0], |f| {
+                    [
+                        f.first as f32,
+                        f32::from(u8::from(f.spot)),
+                        f.shadow.bias,
+                        f.shadow.softness,
+                    ]
+                }),
+                direction: direction.extend(scale).to_array(),
+            });
+        }
+        if !points.is_empty() {
+            gpu.queue.write_texture(
+                self.light_texture.as_image_copy(),
+                bytemuck::cast_slice(&points),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size_of::<PointUniform>() as u32),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: 4,
+                    height: points.len() as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        for (slot, matrix) in uniform.shadow_matrices.iter_mut().zip(&plan.layers) {
+            *slot = matrix.to_cols_array_2d();
         }
         gpu.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
+        if self.transmission.is_some() {
+            uniform.tone[2] = 1.0;
+            uniform.time[1] = 0.0;
+            gpu.queue.write_buffer(
+                &self.frame_buffer,
+                self.frame_stride,
+                bytemuck::bytes_of(&uniform),
+            );
+        }
+    }
 
-        // Opaque draws first; translucent ones after, farthest first.
-        let mut order: Vec<usize> = (0..collected.draws.len()).collect();
-        let depth = |index: usize| {
-            let center = collected.draws[index].0.transform_point3(Vec3::ZERO);
-            (view * center.extend(1.0)).z
-        };
-        let blended: Vec<bool> = collected
-            .draws
-            .iter()
-            .map(|(_, _, material)| translucent(material))
-            .collect();
-        order.sort_by(|&a, &b| {
-            blended[a].cmp(&blended[b]).then_with(|| match blended[a] {
-                true => depth(a).total_cmp(&depth(b)),
-                false => std::cmp::Ordering::Equal,
-            })
-        });
-
-        let count = collected.draws.len() as u64;
+    /// Writes one uniform per draw, at the dynamic offset of the draw's index.
+    fn write_draw_uniforms(&mut self, gpu: &Gpu, draws: &[Draw]) {
+        let count = draws.len() as u64;
         if count > self.draw_capacity {
             let capacity = count.next_power_of_two();
             (self.draw_buffer, self.draw_bind_group) =
@@ -627,100 +676,379 @@ impl Renderer for SceneRenderer {
         }
         self.staging.clear();
         self.staging.resize((self.draw_stride * count) as usize, 0);
-        for (slot, &index) in order.iter().enumerate() {
-            let (model, _, material) = &collected.draws[index];
-            let offset = slot * self.draw_stride as usize;
-            let uniform = draw_uniform(*model, material);
+        for (index, draw) in draws.iter().enumerate() {
+            let offset = index * self.draw_stride as usize;
+            let uniform = draw_uniform(draw.model, &draw.material, draw.receive_shadow);
             let bytes = bytemuck::bytes_of(&uniform);
             self.staging[offset..offset + bytes.len()].copy_from_slice(bytes);
         }
         if !self.staging.is_empty() {
             gpu.queue.write_buffer(&self.draw_buffer, 0, &self.staging);
         }
+    }
 
+    fn clear_color(&self, background: Color) -> wgpu::Color {
+        let rgba = if self.encode_srgb && self.post.is_none() {
+            srgb_rgba(background)
+        } else {
+            linear_rgba(background)
+        };
+        let [r, g, b, a] = Vec4::from(rgba).as_dvec4().to_array();
+        wgpu::Color { r, g, b, a }
+    }
+
+    fn encode_forward(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        target: Target<'_>,
+        draws: &[Draw],
+        order: &[Ordered],
+        backdrop: Backdrop,
+    ) {
         let shared = self.shared.clone();
-        let (format, samples) = (self.format, self.samples);
-        let opaque_pipeline = shared.pipeline(gpu, format, samples, false);
-        let blend_pipeline = shared.pipeline(gpu, format, samples, true);
-        let clear = {
-            let rgba = if self.encode_srgb {
-                srgb_rgba(inner.background())
-            } else {
-                linear_rgba(inner.background())
-            };
-            Vec4::from(rgba).as_dvec4()
-        };
-        self.prepare_attachments(gpu);
-        let Some(attachments) = &self.attachments else {
-            return;
-        };
-        let (view_target, resolve_target) = match &attachments.msaa {
+        let Target {
+            view: target,
+            format,
+            samples,
+            depth,
+            msaa,
+        } = target;
+        let (view_target, resolve_target) = match msaa {
             Some(msaa) => (msaa, Some(target)),
             None => (target, None),
         };
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("whisker-scene"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("whisker-scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: view_target,
-                    depth_slice: None,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear.x,
-                            g: clear.y,
-                            b: clear.z,
-                            a: clear.w,
-                        }),
-                        store: if resolve_target.is_some() {
-                            wgpu::StoreOp::Discard
-                        } else {
-                            wgpu::StoreOp::Store
-                        },
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("whisker-scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: view_target,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(backdrop.clear),
+                    store: if resolve_target.is_some() {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
                     },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &attachments.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
                 }),
-                ..Default::default()
-            });
-            pass.set_bind_group(0, &self.frame_bind_group, &[]);
-            for (slot, &index) in order.iter().enumerate() {
-                let (_, geometry, material) = &collected.draws[index];
-                let mesh = mesh(gpu, geometry);
-                if mesh.count == 0 {
-                    continue;
-                }
-                pass.set_pipeline(if blended[index] {
-                    &blend_pipeline
-                } else {
-                    &opaque_pipeline
-                });
-                let offset = (slot as u64 * self.draw_stride) as u32;
-                pass.set_bind_group(1, &self.draw_bind_group, &[offset]);
-                pass.set_bind_group(
-                    2,
-                    &texture(gpu, &shared, base_texture(material)).bind_group,
-                    &[],
-                );
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.count, 0, 0..1);
-            }
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_bind_group(0, &self.frame_bind_group, &[backdrop.frame_offset]);
+        pass.set_bind_group(3, &backdrop.transmission, &[]);
+        if backdrop.sky {
+            pass.set_pipeline(&shared.sky_pipeline(gpu, format, samples));
+            pass.draw(0..3, 0..1);
         }
-        gpu.queue.submit([encoder.finish()]);
+        self.draw_ordered(gpu, &mut pass, format, DEPTH_FORMAT, samples, draws, order);
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_ordered(
+        &mut self,
+        gpu: &Gpu,
+        pass: &mut wgpu::RenderPass<'_>,
+        format: wgpu::TextureFormat,
+        depth: wgpu::TextureFormat,
+        samples: u32,
+        draws: &[Draw],
+        order: &[Ordered],
+    ) {
+        let shared = self.shared.clone();
+        for ordered in order {
+            let draw = &draws[ordered.index];
+            let Draw {
+                model, material, ..
+            } = draw;
+            let Some((count, instances)) = bind_mesh(gpu, &shared, pass, draw) else {
+                continue;
+            };
+            pass.set_pipeline(&shared.pipeline(
+                gpu,
+                PipelineKey {
+                    format,
+                    samples,
+                    blend: ordered.blended,
+                    double_sided: double_sided(material),
+                    mirrored: model.determinant() < 0.0,
+                    shader: shared.shader_key(gpu, material),
+                    masked: masked(material),
+                    depth,
+                },
+            ));
+            let offset = (ordered.index as u64 * self.draw_stride) as u32;
+            pass.set_bind_group(1, &self.draw_bind_group, &[offset]);
+            pass.set_bind_group(2, self.materials.bind_group(gpu, &shared, material), &[]);
+            pass.draw_indexed(0..count, 0, 0..instances);
+        }
+    }
+}
+
+/// The image the forward pass resolves into, and the attachments it draws with.
+struct Target<'a> {
+    view: &'a wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    depth: &'a wgpu::TextureView,
+    msaa: Option<&'a wgpu::TextureView>,
+}
+
+/// What the forward pass draws behind the scene, the clear color then the sky when shown, and the
+/// frame uniform and transmission source it binds.
+struct Backdrop {
+    clear: wgpu::Color,
+    sky: bool,
+    frame_offset: u32,
+    transmission: wgpu::BindGroup,
+}
+
+fn linear_clear(background: Color) -> wgpu::Color {
+    let [r, g, b, a] = Vec4::from(linear_rgba(background)).as_dvec4().to_array();
+    wgpu::Color { r, g, b, a }
+}
+
+/// The opaque scene drawn in linear color, for transmissive surfaces to show through.
+struct TransmissionTarget {
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+    view: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+impl TransmissionTarget {
+    fn new(gpu: &Gpu, shared: &Shared, (width, height): (u32, u32)) -> TransmissionTarget {
+        let (format, _) = post::scene_format(gpu);
+        let texture = |label, format, usage| {
+            gpu.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let view = texture(
+            "whisker-scene transmission",
+            format,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        TransmissionTarget {
+            size: (width, height),
+            format,
+            depth: texture(
+                "whisker-scene transmission depth",
+                DEPTH_FORMAT,
+                wgpu::TextureUsages::empty(),
+            ),
+            bind_group: shared.transmission_bind_group(gpu, &view),
+            view,
+        }
+    }
+}
+
+fn frame_bind_group(
+    gpu: &Gpu,
+    shared: &Shared,
+    buffer: &wgpu::Buffer,
+    shadow_maps: &ShadowMaps,
+    environment: &GpuTexture,
+    lights: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("whisker-scene frame"),
+        layout: &shared.frame_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size_of::<FrameUniform>() as u64),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&shadow_maps.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&shared.shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&environment.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&shared.environment_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(lights),
+            },
+        ],
+    })
 }
 
 #[cfg(test)]
 mod tests;
+
+/// A layer frame between `prepare_layer` and `draw_layer`.
+pub(crate) struct LayerFrame {
+    draws: Vec<Draw>,
+    order: Vec<Ordered>,
+    format: wgpu::TextureFormat,
+    depth: wgpu::TextureFormat,
+    samples: u32,
+}
+
+impl SceneRenderer {
+    /// Draws shadow maps and writes uniforms for a frame seen through a host's camera.
+    pub(crate) fn prepare_layer(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &LayerTarget,
+    ) -> LayerFrame {
+        let scene = self.scene.clone();
+        let inner = scene.inner();
+        inner.run_frame_callbacks(&target.frame);
+        self.size = (target.size.0.max(1), target.size.1.max(1));
+        self.scale = if target.scale > 0.0 {
+            target.scale
+        } else {
+            1.0
+        };
+        let view = Mat4::from_cols_array_2d(&target.view);
+        // The host's view may carry one uniform scale; dividing it out keeps the eye rigid.
+        let scale = view.determinant().abs().cbrt();
+        let rigid = Mat4::from_scale(Vec3::splat(1.0 / scale)) * view;
+        let eye = Eye {
+            world: rigid.inverse(),
+            projection: Mat4::from_cols_array_2d(&target.projection)
+                * Mat4::from_scale(Vec3::splat(scale)),
+        };
+        let FramePlan {
+            collected,
+            plan,
+            order,
+            view_proj,
+        } = self.plan_frame(gpu, inner, eye, false);
+        self.post = None;
+        self.transmission = None;
+        self.write_frame(gpu, target.frame, inner, &collected, &plan, view_proj, eye);
+        self.encode_shadows(gpu, encoder, &collected.draws, &plan);
+        LayerFrame {
+            draws: collected.draws,
+            order,
+            format: target.color_format,
+            depth: target.depth_format,
+            samples: target.samples,
+        }
+    }
+
+    pub(crate) fn draw_layer(
+        &mut self,
+        gpu: &Gpu,
+        pass: &mut wgpu::RenderPass<'_>,
+        frame: &LayerFrame,
+    ) {
+        pass.set_bind_group(0, &self.frame_bind_group, &[0]);
+        pass.set_bind_group(3, &self.shared.no_transmission, &[]);
+        self.draw_ordered(
+            gpu,
+            pass,
+            frame.format,
+            frame.depth,
+            frame.samples,
+            &frame.draws,
+            &frame.order,
+        );
+        self.materials.sweep();
+    }
+}
+
+/// A scene drawn as a layer of another renderer.
+pub(crate) struct SceneLayer {
+    scene: Scene,
+    renderer: Option<SceneRenderer>,
+    frame: Option<LayerFrame>,
+    host: Option<Rc<LayerHost>>,
+}
+
+impl SceneLayer {
+    pub(crate) fn new(scene: Scene) -> SceneLayer {
+        SceneLayer {
+            scene,
+            renderer: None,
+            frame: None,
+            host: None,
+        }
+    }
+}
+
+impl Layer for SceneLayer {
+    fn attach(&mut self, host: LayerHost) {
+        let host = Rc::new(host);
+        self.scene.add_layer_host(&host);
+        self.host = Some(host);
+    }
+
+    fn detach(&mut self) {
+        self.host = None;
+    }
+
+    fn prepare(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &LayerTarget) {
+        if self
+            .renderer
+            .as_ref()
+            .is_none_or(|renderer| renderer.format != target.color_format)
+        {
+            let mut renderer = SceneRenderer::new(gpu, target.color_format, self.scene.clone());
+            renderer.pooled_shadows = false;
+            self.renderer = Some(renderer);
+        }
+        if let Some(renderer) = &mut self.renderer {
+            self.frame = Some(renderer.prepare_layer(gpu, encoder, target));
+        }
+    }
+
+    fn draw(&mut self, gpu: &Gpu, pass: &mut wgpu::RenderPass<'_>, _target: &LayerTarget) {
+        if let (Some(renderer), Some(frame)) = (&mut self.renderer, self.frame.take()) {
+            renderer.draw_layer(gpu, pass, &frame);
+        }
+    }
+
+    fn tap(&mut self, point: [f32; 2], target: &LayerTarget) -> bool {
+        let view = Mat4::from_cols_array_2d(&target.view);
+        let view_proj = Mat4::from_cols_array_2d(&target.projection) * view;
+        let size = Vec2::new(target.size.0 as f32, target.size.1 as f32) / target.scale.max(1e-6);
+        let Some(ray) = ray_through(view_proj, Vec2::from(point), size) else {
+            return false;
+        };
+        let eye = view.inverse().transform_point3(Vec3::ZERO);
+        self.scene
+            .raycast_from(ray, eye)
+            .first()
+            .is_some_and(dispatch_tap)
+    }
+}

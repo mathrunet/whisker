@@ -1,13 +1,16 @@
 use std::time::Duration;
 
-use glam::{Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use whisker::css::Color;
 use whisker_surface::{FrameInfo, SurfaceSize};
 use whisker_wgpu::{Gpu, Renderer, wgpu};
 
+use super::pipeline::SHARED;
 use super::*;
 use crate::core::{
-    Geometry, Light, Material, Node, Projection, Scene, StandardMaterial, Transform,
+    AlphaMode, AmbientOcclusion, Bloom, CustomMaterial, DepthOfField, Environment, Fog, Geometry,
+    Instances, Light, Material, MaterialShader, Node, PostProcessing, Projection, Scene, Shadow,
+    StandardMaterial, Texture, ToneMapping, Transform,
 };
 
 #[test]
@@ -32,10 +35,10 @@ fn collect_composes_transforms_and_skips_hidden_subtrees() {
     root.add_child(&hidden);
     hidden.add_child(&under_hidden);
 
-    let collected = collect(&root);
+    let collected = collect(&root, Vec3::ZERO);
     assert_eq!(collected.draws.len(), 1);
     assert_eq!(
-        collected.draws[0].0.transform_point3(Vec3::ZERO),
+        collected.draws[0].model.transform_point3(Vec3::ZERO),
         Vec3::new(1.0, 1.0, 0.0)
     );
 }
@@ -51,12 +54,13 @@ fn directional_lights_point_back_toward_the_light() {
     light.set_light(Some(Light::Directional {
         color: Color::rgb(255, 255, 255),
         intensity: 2.0,
+        shadow: None,
     }));
     root.add_child(&light);
-    let collected = collect(&root);
-    let (toward, radiance) = collected.directional[0];
-    assert!(toward.abs_diff_eq(Vec3::Y, 1e-5), "{toward}");
-    assert_eq!(radiance, [2.0, 2.0, 2.0, 0.0]);
+    let collected = collect(&root, Vec3::ZERO);
+    let light = &collected.directional[0];
+    assert!(light.toward.abs_diff_eq(Vec3::Y, 1e-5), "{}", light.toward);
+    assert_eq!(light.radiance, [2.0, 2.0, 2.0, 0.0]);
 }
 
 /// Runs `test` with a device of its own, dropping every GPU object before the test thread exits.
@@ -73,8 +77,11 @@ fn with_gpu(test: impl FnOnce(&Gpu)) {
         eprintln!("skipping: no GPU adapter");
         return;
     };
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+        ..Default::default()
+    }))
+    .unwrap();
     let gpu = Gpu {
         instance,
         adapter,
@@ -89,7 +96,34 @@ const SIZE: u32 = 64;
 
 /// Renders `scene` offscreen and returns its sRGB pixels.
 fn render(gpu: &Gpu, scene: Scene) -> Vec<[u8; 4]> {
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    render_into(gpu, scene, wgpu::TextureFormat::Rgba8UnormSrgb)
+}
+
+/// Renders `scene` into a `format` target, as one first frame.
+fn render_into(gpu: &Gpu, scene: Scene, format: wgpu::TextureFormat) -> Vec<[u8; 4]> {
+    let mut renderer = sized_renderer(gpu, scene, format);
+    draw_frame(gpu, &mut renderer, format)
+}
+
+fn sized_renderer(gpu: &Gpu, scene: Scene, format: wgpu::TextureFormat) -> SceneRenderer {
+    let mut renderer = SceneRenderer::new(gpu, format, scene);
+    renderer.resize(
+        gpu,
+        SurfaceSize {
+            width: SIZE,
+            height: SIZE,
+            scale: 1.0,
+        },
+    );
+    renderer
+}
+
+/// Renders one frame of `renderer` into a fresh `format` target and reads it back.
+fn draw_frame(
+    gpu: &Gpu,
+    renderer: &mut SceneRenderer,
+    format: wgpu::TextureFormat,
+) -> Vec<[u8; 4]> {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
@@ -104,15 +138,6 @@ fn render(gpu: &Gpu, scene: Scene) -> Vec<[u8; 4]> {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let mut renderer = SceneRenderer::new(gpu, format, scene);
-    renderer.resize(
-        gpu,
-        SurfaceSize {
-            width: SIZE,
-            height: SIZE,
-            scale: 1.0,
-        },
-    );
     renderer.render(
         gpu,
         &texture.create_view(&Default::default()),
@@ -173,6 +198,55 @@ fn draws_an_unlit_mesh_over_the_background() {
 }
 
 #[test]
+fn masked_surfaces_cut_out_below_their_cutoff_and_stay_opaque_above_it() {
+    with_gpu(|gpu| {
+        let center = |alpha: f32| {
+            let scene = Scene::new();
+            scene.set_background(Color::rgb(0, 0, 255));
+            let mesh = Node::new();
+            mesh.set_mesh(Some((
+                Geometry::cuboid(Vec3::splat(1.0)),
+                Material::Standard(StandardMaterial {
+                    base_color: Color::rgba(255, 0, 0, alpha),
+                    emissive: Color::rgb(255, 0, 0),
+                    alpha_mode: AlphaMode::Mask(0.5),
+                    ..Default::default()
+                }),
+            )));
+            scene.root().add_child(&mesh);
+            pixel(&render(gpu, scene), SIZE / 2, SIZE / 2)
+        };
+        assert_eq!(center(0.25), [0, 0, 255, 255]);
+        let kept = center(0.8);
+        assert!(kept[0] > 200 && kept[2] < 40, "{kept:?}");
+    });
+}
+
+#[test]
+fn masked_casters_cast_only_where_they_are_solid() {
+    with_gpu(|gpu| {
+        let floor_behind = |alpha: f32| {
+            let (scene, _, caster, view_proj) =
+                shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+            caster.set_mesh(Some((
+                Geometry::cuboid(Vec3::ONE),
+                Material::Standard(StandardMaterial {
+                    base_color: Color::rgba(255, 255, 255, alpha),
+                    alpha_mode: AlphaMode::Mask(0.5),
+                    ..Default::default()
+                }),
+            )));
+            scene.root().add_child(&sun(Some(SUN_SHADOW)));
+            floor_pixel(&render(gpu, scene), view_proj, -1.5, 0.0)
+        };
+        let solid = floor_behind(1.0);
+        let cut = floor_behind(0.25);
+        assert!(solid[0] < 20, "solid {solid:?}");
+        assert!(cut[0] > 200, "cut {cut:?}");
+    });
+}
+
+#[test]
 fn a_light_facing_the_surface_brightens_it_fully() {
     with_gpu(|gpu| {
         let scene = Scene::new();
@@ -203,6 +277,7 @@ fn a_light_facing_the_surface_brightens_it_fully() {
         light.set_light(Some(Light::Directional {
             color: Color::rgb(255, 255, 255),
             intensity: 1.0,
+            shadow: None,
         }));
         for node in [&camera, &floor, &light] {
             scene.root().add_child(node);
@@ -240,5 +315,1511 @@ fn translucent_meshes_blend_over_opaque_ones() {
         scene.root().add_child(&back);
         let center = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2);
         assert!((180..=195).contains(&center[0]), "{center:?}");
+    });
+}
+
+#[test]
+fn a_mesh_centered_off_screen_still_draws_the_part_in_view() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        scene.set_background(Color::rgb(0, 0, 255));
+        let mesh = Node::new();
+        mesh.set_transform(Transform::from_translation(Vec3::new(6.0, 0.0, 0.0)));
+        mesh.set_mesh(Some((
+            Geometry::cuboid(Vec3::new(12.0, 1.0, 1.0)),
+            Material::Unlit {
+                color: Color::rgb(255, 0, 0),
+            },
+        )));
+        scene.root().add_child(&mesh);
+        let pixels = render(gpu, scene);
+        assert_eq!(pixel(&pixels, SIZE / 2 + 4, SIZE / 2), [255, 0, 0, 255]);
+    });
+}
+
+/// A white matte floor seen from straight above, with a unit cube floating at `cube`.
+fn shadow_stage(eye: Vec3, fov_y: f32, cube: Vec3) -> (Scene, Node, Node, Mat4) {
+    let scene = Scene::new();
+    let camera = Node::new();
+    let transform = Transform::looking_at(eye, Vec3::new(eye.x, 0.0, eye.z), Vec3::NEG_Z);
+    let projection = Projection::Perspective {
+        fov_y,
+        near: 0.1,
+        far: 20.0,
+    };
+    camera.set_transform(transform);
+    camera.set_camera(Some(projection));
+    let floor = Node::new();
+    floor.set_mesh(Some((
+        Geometry::plane(Vec2::splat(12.0)),
+        Material::Standard(StandardMaterial {
+            roughness: 1.0,
+            ..Default::default()
+        }),
+    )));
+    let caster = Node::new();
+    caster.set_transform(Transform::from_translation(cube));
+    caster.set_mesh(Some((
+        Geometry::cuboid(Vec3::ONE),
+        Material::Unlit {
+            color: Color::rgb(255, 0, 0),
+        },
+    )));
+    for node in [&camera, &floor, &caster] {
+        scene.root().add_child(node);
+    }
+    let view_proj = projection.to_matrix(1.0) * transform.to_matrix().inverse();
+    (scene, floor, caster, view_proj)
+}
+
+/// The pixel a point on the floor lands on.
+fn floor_pixel(pixels: &[[u8; 4]], view_proj: Mat4, x: f32, z: f32) -> [u8; 4] {
+    let ndc = view_proj.project_point3(Vec3::new(x, 0.0, z));
+    let column = ((ndc.x * 0.5 + 0.5) * SIZE as f32) as u32;
+    let row = ((0.5 - ndc.y * 0.5) * SIZE as f32) as u32;
+    pixel(pixels, column.min(SIZE - 1), row.min(SIZE - 1))
+}
+
+/// A sun shining down and toward -X at 45°.
+fn sun(shadow: Option<Shadow>) -> Node {
+    let light = Node::new();
+    light.set_transform(Transform {
+        rotation: crate::core::rotation_toward(Vec3::new(-1.0, -1.0, 0.0), Vec3::Y),
+        ..Transform::IDENTITY
+    });
+    light.set_light(Some(Light::Directional {
+        color: Color::rgb(255, 255, 255),
+        intensity: 1.0,
+        shadow,
+    }));
+    light
+}
+
+const SUN_SHADOW: Shadow = Shadow {
+    map_size: 512,
+    cascades: 2,
+    distance: 20.0,
+    softness: 1.0,
+    bias: 1.0,
+};
+
+#[test]
+fn a_shadowing_sun_darkens_the_floor_behind_a_mesh() {
+    with_gpu(|gpu| {
+        let (scene, _, _, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        scene.root().add_child(&sun(Some(SUN_SHADOW)));
+        let pixels = render(gpu, scene);
+        let shadowed = floor_pixel(&pixels, view_proj, -1.5, 0.0);
+        let lit = floor_pixel(&pixels, view_proj, 1.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 200, "lit {lit:?}");
+    });
+}
+
+#[test]
+fn views_share_their_frame_targets_without_mixing_frames() {
+    with_gpu(|gpu| {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (shaded, _, _, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        shaded.root().add_child(&sun(Some(SUN_SHADOW)));
+        let (clear, _, _, _) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::X * 4.0);
+        clear.root().add_child(&sun(Some(SUN_SHADOW)));
+        let mut first = sized_renderer(gpu, shaded, format);
+        let mut second = sized_renderer(gpu, clear, format);
+        draw_frame(gpu, &mut first, format);
+        let clear_pixels = draw_frame(gpu, &mut second, format);
+        let shaded_pixels = draw_frame(gpu, &mut first, format);
+        assert!(Rc::ptr_eq(&first.shadow_maps, &second.shadow_maps));
+        assert!(Rc::ptr_eq(
+            first.attachments.as_ref().unwrap(),
+            second.attachments.as_ref().unwrap()
+        ));
+        let shadowed = floor_pixel(&shaded_pixels, view_proj, -1.5, 0.0);
+        let lit = floor_pixel(&clear_pixels, view_proj, -1.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 200, "lit {lit:?}");
+    });
+}
+
+#[test]
+fn a_sun_without_a_shadow_lights_the_floor_behind_a_mesh() {
+    with_gpu(|gpu| {
+        let (scene, _, _, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        scene.root().add_child(&sun(None));
+        let pixel = floor_pixel(&render(gpu, scene), view_proj, -1.5, 0.0);
+        assert!(pixel[0] > 200, "{pixel:?}");
+    });
+}
+
+#[test]
+fn shadow_flags_opt_meshes_out_of_casting_and_receiving() {
+    with_gpu(|gpu| {
+        let (scene, floor, caster, view_proj) =
+            shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        scene.root().add_child(&sun(Some(SUN_SHADOW)));
+        caster.set_cast_shadow(false);
+        let pixel = floor_pixel(&render(gpu, scene.clone()), view_proj, -1.5, 0.0);
+        assert!(pixel[0] > 200, "not casting {pixel:?}");
+
+        caster.set_cast_shadow(true);
+        floor.set_receive_shadow(false);
+        let pixel = floor_pixel(&render(gpu, scene), view_proj, -1.5, 0.0);
+        assert!(pixel[0] > 200, "not receiving {pixel:?}");
+    });
+}
+
+#[test]
+fn a_mesh_outside_the_view_still_casts_into_it() {
+    with_gpu(|gpu| {
+        let (scene, _, _, view_proj) = shadow_stage(Vec3::new(-2.5, 3.0, 0.0), 0.3, Vec3::Y * 2.5);
+        scene.root().add_child(&sun(Some(SUN_SHADOW)));
+        let pixel = floor_pixel(&render(gpu, scene), view_proj, -2.5, 0.0);
+        assert!(pixel[0] < 20, "{pixel:?}");
+    });
+}
+
+#[test]
+fn a_shadowing_point_light_darkens_the_floor_under_a_mesh() {
+    with_gpu(|gpu| {
+        let (scene, _, _, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        let light = Node::new();
+        light.set_transform(Transform::from_translation(Vec3::Y * 3.0));
+        light.set_light(Some(Light::Point {
+            color: Color::rgb(255, 255, 255),
+            intensity: 10.0,
+            range: 20.0,
+            shadow: Some(Shadow {
+                map_size: 256,
+                ..Shadow::default()
+            }),
+        }));
+        scene.root().add_child(&light);
+        let pixels = render(gpu, scene);
+        let shadowed = floor_pixel(&pixels, view_proj, 1.2, 0.0);
+        let lit = floor_pixel(&pixels, view_proj, 2.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 150, "lit {lit:?}");
+    });
+}
+
+fn spot(at: Vec3, outer_angle: f32, shadow: Option<Shadow>) -> Node {
+    let light = Node::new();
+    light.set_transform(Transform {
+        translation: at,
+        rotation: crate::core::rotation_toward(Vec3::NEG_Y, Vec3::Y),
+        scale: Vec3::ONE,
+    });
+    light.set_light(Some(Light::Spot {
+        color: Color::rgb(255, 255, 255),
+        intensity: 9.0,
+        range: 20.0,
+        inner_angle: outer_angle * 0.8,
+        outer_angle,
+        shadow,
+    }));
+    light
+}
+
+#[test]
+fn a_spot_light_lights_only_inside_its_cone() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) =
+            shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        caster.remove_from_parent();
+        scene.root().add_child(&spot(Vec3::Y * 3.0, 0.4, None));
+        let pixels = render(gpu, scene);
+        let inside = floor_pixel(&pixels, view_proj, 0.5, 0.0);
+        let outside = floor_pixel(&pixels, view_proj, 2.5, 0.0);
+        assert!(inside[0] > 200, "inside {inside:?}");
+        assert_eq!(outside, [0, 0, 0, 255]);
+    });
+}
+
+#[test]
+fn a_shadowing_spot_light_darkens_the_floor_under_a_mesh() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) =
+            shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        caster.set_transform(Transform {
+            translation: Vec3::Y * 1.5,
+            scale: Vec3::splat(0.4),
+            ..Transform::IDENTITY
+        });
+        scene.root().add_child(&spot(
+            Vec3::new(-1.0, 3.0, 0.0),
+            0.9,
+            Some(Shadow {
+                map_size: 256,
+                ..Shadow::default()
+            }),
+        ));
+        let pixels = render(gpu, scene);
+        // The cube at x 0 casts toward +x, twice as far out as it is from the light.
+        let shadowed = floor_pixel(&pixels, view_proj, 1.0, 0.0);
+        let lit = floor_pixel(&pixels, view_proj, -1.0, 0.8);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 150, "lit {lit:?}");
+    });
+}
+
+#[test]
+fn a_hemisphere_light_shades_by_facing() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) =
+            shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        caster.remove_from_parent();
+        scene.set_hemisphere_light(Color::rgb(255, 0, 0), Color::rgb(0, 0, 255), 1.0);
+        let up = floor_pixel(&render(gpu, scene), view_proj, 1.0, 0.0);
+        assert!(up[0] > 200 && up[2] < 20, "{up:?}");
+    });
+}
+
+/// The floor's brightness under a sun of `intensity` straight above, with `tone_mapping`.
+fn toned(gpu: &Gpu, tone_mapping: ToneMapping, exposure: f32, intensity: f32) -> u8 {
+    toned_through(
+        gpu,
+        tone_mapping,
+        exposure,
+        intensity,
+        PostProcessing::default(),
+    )
+}
+
+fn toned_through(
+    gpu: &Gpu,
+    tone_mapping: ToneMapping,
+    exposure: f32,
+    intensity: f32,
+    post_processing: PostProcessing,
+) -> u8 {
+    let (scene, _, caster, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+    caster.remove_from_parent();
+    let light = Node::new();
+    light.set_transform(Transform {
+        rotation: crate::core::rotation_toward(Vec3::NEG_Y, Vec3::Z),
+        ..Transform::IDENTITY
+    });
+    light.set_light(Some(Light::Directional {
+        color: Color::rgb(255, 255, 255),
+        intensity,
+        shadow: None,
+    }));
+    scene.root().add_child(&light);
+    scene.set_tone_mapping(tone_mapping, exposure);
+    scene.set_post_processing(post_processing);
+    floor_pixel(&render(gpu, scene), view_proj, 1.0, 0.0)[0]
+}
+
+#[test]
+fn tone_mapping_rolls_off_highlights_instead_of_clipping() {
+    with_gpu(|gpu| {
+        assert_eq!(toned(gpu, ToneMapping::None, 1.0, 4.0), 255);
+        assert_eq!(
+            toned(gpu, ToneMapping::None, 0.25, 4.0),
+            toned(gpu, ToneMapping::None, 1.0, 1.0)
+        );
+        // 4 / (1 + 4) is 0.8 linear, 231 encoded.
+        let reinhard = toned(gpu, ToneMapping::Reinhard, 1.0, 4.0);
+        assert!((229..=233).contains(&reinhard), "{reinhard}");
+        for curve in [ToneMapping::Aces, ToneMapping::AgX] {
+            let (dim, bright) = (toned(gpu, curve, 1.0, 0.5), toned(gpu, curve, 1.0, 4.0));
+            assert!(dim < bright && bright < 255, "{curve:?} {dim} {bright}");
+        }
+    });
+}
+
+#[test]
+fn fog_fades_distant_surfaces_into_its_color() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        let mesh = Node::new();
+        mesh.set_mesh(Some((
+            Geometry::cuboid(Vec3::ONE),
+            Material::Unlit {
+                color: Color::rgb(255, 0, 0),
+            },
+        )));
+        scene.root().add_child(&mesh);
+        let gray = Color::rgb(128, 128, 128);
+        scene.set_fog(Some(Fog::Linear {
+            color: gray,
+            near: 0.0,
+            far: 1.0,
+        }));
+        assert_eq!(
+            pixel(&render(gpu, scene.clone()), SIZE / 2, SIZE / 2),
+            [128, 128, 128, 255]
+        );
+
+        scene.set_fog(Some(Fog::Exponential {
+            color: gray,
+            density: 0.01,
+        }));
+        let thin = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2);
+        assert!(thin[0] > 240 && thin[1] < 20, "{thin:?}");
+    });
+}
+
+/// An environment colored by the axis each direction leans most toward.
+fn axis_environment() -> Environment {
+    let (width, height) = (128, 64);
+    let pixels = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let theta = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
+            let phi = ((x as f32 + 0.5) / width as f32 - 0.5) * 2.0 * std::f32::consts::PI;
+            let d = Vec3::new(
+                theta.sin() * phi.sin(),
+                theta.cos(),
+                -theta.sin() * phi.cos(),
+            );
+            let a = d.abs();
+            if a.x >= a.y && a.x >= a.z {
+                if d.x > 0.0 { Vec3::X } else { Vec3::Z }
+            } else if a.y >= a.z {
+                if d.y > 0.0 { Vec3::ONE } else { Vec3::ZERO }
+            } else if d.z > 0.0 {
+                Vec3::Y
+            } else {
+                Vec3::new(1.0, 1.0, 0.0)
+            }
+        })
+        .collect();
+    Environment::from_radiance(width, height, pixels)
+}
+
+fn mirror_from(eye: Vec3, up: Vec3) -> [u8; 4] {
+    let scene = Scene::new();
+    scene.set_environment(Some(axis_environment()), 1.0);
+    let camera = Node::new();
+    camera.set_transform(Transform::looking_at(eye, Vec3::ZERO, up));
+    camera.set_camera(Some(Projection::Perspective {
+        fov_y: 0.3,
+        near: 0.1,
+        far: 20.0,
+    }));
+    let mirror = Node::new();
+    mirror.set_mesh(Some((
+        Geometry::cuboid(Vec3::ONE),
+        Material::Standard(StandardMaterial {
+            metallic: 1.0,
+            roughness: 0.0,
+            ..Default::default()
+        }),
+    )));
+    scene.root().add_child(&camera);
+    scene.root().add_child(&mirror);
+    let mut out = [0; 4];
+    with_gpu(|gpu| out = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2));
+    out
+}
+
+#[test]
+fn a_mirror_reflects_the_environment_it_faces() {
+    let red = mirror_from(Vec3::X * 5.0, Vec3::Y);
+    assert!(red[0] > 200 && red[1] < 40 && red[2] < 40, "+X {red:?}");
+    let green = mirror_from(Vec3::Z * 5.0, Vec3::Y);
+    assert!(
+        green[1] > 200 && green[0] < 40 && green[2] < 40,
+        "+Z {green:?}"
+    );
+    let white = mirror_from(Vec3::Y * 5.0, Vec3::Z);
+    assert!(white.iter().take(3).all(|c| *c > 200), "+Y {white:?}");
+}
+
+#[test]
+fn an_even_environment_lights_a_matte_surface_by_its_radiance() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) =
+            shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        caster.remove_from_parent();
+        let environment = Environment::from_radiance(8, 4, vec![Vec3::splat(0.5); 32]);
+        scene.set_environment(Some(environment), 1.0);
+        let lit = floor_pixel(&render(gpu, scene), view_proj, 1.0, 0.0);
+        // 0.5 minus the few percent reflected instead of diffused, about 180 encoded.
+        assert!((170..=192).contains(&lit[0]), "{lit:?}");
+    });
+}
+
+#[test]
+fn the_environment_can_stand_in_for_the_background() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        scene.set_background(Color::rgb(0, 0, 255));
+        scene.set_environment(Some(axis_environment()), 1.0);
+        let pixels = render(gpu, scene.clone());
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [0, 0, 255, 255]);
+
+        scene.set_environment_background(true);
+        // The default camera looks down -Z, which the environment paints yellow.
+        let sky = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2);
+        assert!(sky[0] > 200 && sky[1] > 200 && sky[2] < 40, "{sky:?}");
+    });
+}
+
+/// A red cube `size` wide over a blue background, from the default camera.
+fn post_stage(size: f32, post_processing: PostProcessing) -> Scene {
+    let scene = Scene::new();
+    scene.set_background(Color::rgb(0, 0, 255));
+    let mesh = Node::new();
+    mesh.set_mesh(Some((
+        Geometry::cuboid(Vec3::splat(size)),
+        Material::Unlit {
+            color: Color::rgb(255, 0, 0),
+        },
+    )));
+    scene.root().add_child(&mesh);
+    scene.set_post_processing(post_processing);
+    scene
+}
+
+/// The first column right of center that shows the background.
+fn cube_edge(pixels: &[[u8; 4]]) -> u32 {
+    (SIZE / 2..SIZE)
+        .find(|&x| pixel(pixels, x, SIZE / 2)[0] < 128)
+        .unwrap()
+}
+
+#[test]
+fn flat_regions_pass_through_the_post_chain_unchanged() {
+    with_gpu(|gpu| {
+        let pixels = render(
+            gpu,
+            post_stage(
+                1.0,
+                PostProcessing {
+                    fxaa: true,
+                    ..Default::default()
+                },
+            ),
+        );
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&pixels, 0, 0), [0, 0, 255, 255]);
+    });
+}
+
+#[test]
+fn views_with_different_post_chains_share_targets_without_mixing_frames() {
+    with_gpu(|gpu| {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let bloom = || {
+            post_stage(
+                0.5,
+                PostProcessing {
+                    bloom: Some(Bloom {
+                        threshold: 0.5,
+                        intensity: 1.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        let fxaa = || {
+            post_stage(
+                1.0,
+                PostProcessing {
+                    fxaa: true,
+                    ..Default::default()
+                },
+            )
+        };
+        let bloom_alone = render(gpu, bloom());
+        let fxaa_alone = render(gpu, fxaa());
+        let mut first = sized_renderer(gpu, bloom(), format);
+        let mut second = sized_renderer(gpu, fxaa(), format);
+        draw_frame(gpu, &mut first, format);
+        let fxaa_shared = draw_frame(gpu, &mut second, format);
+        let bloom_shared = draw_frame(gpu, &mut first, format);
+        assert!(Rc::ptr_eq(
+            first.post.as_ref().unwrap(),
+            second.post.as_ref().unwrap()
+        ));
+        assert!(bloom_shared == bloom_alone);
+        assert!(fxaa_shared == fxaa_alone);
+    });
+}
+
+#[test]
+fn bloom_spreads_bright_surfaces_past_their_edges() {
+    with_gpu(|gpu| {
+        let plain = render(gpu, post_stage(0.5, PostProcessing::default()));
+        let edge = cube_edge(&plain);
+        let bloom = PostProcessing {
+            bloom: Some(Bloom {
+                threshold: 0.5,
+                intensity: 1.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let glowing = render(gpu, post_stage(0.5, bloom));
+        let (before, after) = (
+            pixel(&plain, edge + 2, SIZE / 2),
+            pixel(&glowing, edge + 2, SIZE / 2),
+        );
+        assert!(after[0] > before[0] + 20, "{before:?} {after:?}");
+    });
+}
+
+#[test]
+fn depth_of_field_blurs_surfaces_away_from_focus() {
+    with_gpu(|gpu| {
+        let plain = render(gpu, post_stage(1.0, PostProcessing::default()));
+        let edge = cube_edge(&plain);
+        let blur = |focus_distance| PostProcessing {
+            depth_of_field: Some(DepthOfField {
+                focus_distance,
+                focus_range: 0.5,
+                max_blur: 8.0,
+            }),
+            ..Default::default()
+        };
+        let blurred = render(gpu, post_stage(1.0, blur(100.0)));
+        let outside = pixel(&blurred, edge + 1, SIZE / 2);
+        assert!(outside[0] > 40, "{outside:?}");
+        assert_eq!(pixel(&blurred, 0, 0), [0, 0, 255, 255]);
+    });
+}
+
+#[test]
+fn ambient_occlusion_darkens_the_floor_beside_a_mesh() {
+    with_gpu(|gpu| {
+        let floor_at = |occlusion: Option<AmbientOcclusion>| {
+            let (scene, _, _, view_proj) =
+                shadow_stage(Vec3::new(2.0, 4.0, 0.0), 1.2, Vec3::Y * 0.5);
+            scene.set_ambient_light(Color::rgb(255, 255, 255), 0.5);
+            scene.set_post_processing(PostProcessing {
+                ambient_occlusion: occlusion,
+                ..Default::default()
+            });
+            let pixels = render(gpu, scene);
+            (
+                i32::from(floor_pixel(&pixels, view_proj, 0.6, 0.0)[0]),
+                i32::from(floor_pixel(&pixels, view_proj, 3.0, 2.0)[0]),
+            )
+        };
+        let (near, far) = floor_at(None);
+        let (occluded_near, occluded_far) = floor_at(Some(AmbientOcclusion::default()));
+        assert!(occluded_near + 20 < near, "{near} {occluded_near}");
+        assert!(occluded_far + 3 >= far, "{far} {occluded_far}");
+    });
+}
+
+/// A lookup table of `size` slices laid side by side, mapping each color through `map`.
+fn lookup_table(size: u32, map: impl Fn([u32; 3]) -> [u32; 3]) -> Texture {
+    let level = |v: u32| v * 255 / (size - 1);
+    let mut pixels = Vec::new();
+    for g in 0..size {
+        for b in 0..size {
+            for r in 0..size {
+                let [r, g, b] = map([level(r), level(g), level(b)]);
+                pixels.extend([r as u8, g as u8, b as u8, 255]);
+            }
+        }
+    }
+    Texture::from_rgba8(size * size, size, pixels)
+}
+
+#[test]
+fn color_grading_maps_colors_through_the_lookup_table() {
+    with_gpu(|gpu| {
+        let graded = |lut| {
+            render(
+                gpu,
+                post_stage(
+                    1.0,
+                    PostProcessing {
+                        color_grading: Some(lut),
+                        ..Default::default()
+                    },
+                ),
+            )
+        };
+        let identity = graded(lookup_table(16, |c| c));
+        assert_eq!(pixel(&identity, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&identity, 0, 0), [0, 0, 255, 255]);
+        let inverted = graded(lookup_table(16, |c| c.map(|v| 255 - v)));
+        assert_eq!(pixel(&inverted, SIZE / 2, SIZE / 2), [0, 255, 255, 255]);
+    });
+}
+
+#[test]
+fn the_post_chain_tone_maps_from_the_first_frame() {
+    with_gpu(|gpu| {
+        let fxaa = PostProcessing {
+            fxaa: true,
+            ..Default::default()
+        };
+        let direct = toned(gpu, ToneMapping::Reinhard, 1.0, 4.0);
+        let post = toned_through(gpu, ToneMapping::Reinhard, 1.0, 4.0, fxaa);
+        assert!(direct.abs_diff(post) <= 2, "{direct} {post}");
+    });
+}
+
+#[test]
+fn the_post_chain_encodes_for_linear_targets() {
+    with_gpu(|gpu| {
+        for fxaa in [false, true] {
+            let scene = post_stage(
+                1.0,
+                PostProcessing {
+                    fxaa,
+                    color_grading: Some(lookup_table(16, |c| c)),
+                    ..Default::default()
+                },
+            );
+            let pixels = render_into(gpu, scene, wgpu::TextureFormat::Rgba8Unorm);
+            assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
+            assert_eq!(pixel(&pixels, 0, 0), [0, 0, 255, 255]);
+        }
+    });
+}
+
+#[test]
+fn bloom_picks_up_light_brighter_than_white() {
+    with_gpu(|gpu| {
+        let glowing = |bloom: Option<Bloom>| {
+            let scene = post_stage(
+                0.5,
+                PostProcessing {
+                    bloom,
+                    ..Default::default()
+                },
+            );
+            let mesh = Node::new();
+            mesh.set_mesh(Some((
+                Geometry::cuboid(Vec3::splat(0.5)),
+                Material::Standard(StandardMaterial {
+                    base_color: Color::rgb(0, 0, 0),
+                    emissive: Color::rgb(255, 255, 255),
+                    emissive_intensity: 4.0,
+                    ..Default::default()
+                }),
+            )));
+            scene.root().add_child(&mesh);
+            render(gpu, scene)
+        };
+        let plain = glowing(None);
+        let edge = cube_edge(&plain);
+        let bloomed = glowing(Some(Bloom {
+            intensity: 1.0,
+            ..Default::default()
+        }));
+        let (before, after) = (
+            pixel(&plain, edge + 2, SIZE / 2),
+            pixel(&bloomed, edge + 2, SIZE / 2),
+        );
+        assert!(after[0] > before[0] + 20, "{before:?} {after:?}");
+    });
+}
+
+/// A node drawing a red cube half a unit wide at each of `at`, relative to the node at `origin`.
+fn instanced_cubes(origin: Vec3, at: &[Vec3]) -> Node {
+    let node = Node::new();
+    node.set_transform(Transform::from_translation(origin));
+    node.set_mesh(Some((
+        Geometry::cuboid(Vec3::splat(0.5)),
+        Material::Unlit {
+            color: Color::rgb(255, 0, 0),
+        },
+    )));
+    node.set_instances(Some(Instances::new(
+        at.iter().map(|&p| Mat4::from_translation(p)).collect(),
+    )));
+    node
+}
+
+#[test]
+fn instances_draw_one_copy_per_transform() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        scene.set_background(Color::rgb(0, 0, 255));
+        let left = Vec3::new(-1.5, 0.0, 0.0);
+        scene
+            .root()
+            .add_child(&instanced_cubes(Vec3::ZERO, &[left, -left]));
+        let pixels = render(gpu, scene);
+        // The default camera, 5 units back with a 60° field of view, puts x = ±1.5 at ±0.52.
+        assert_eq!(pixel(&pixels, 15, SIZE / 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&pixels, 48, SIZE / 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [0, 0, 255, 255]);
+    });
+}
+
+#[test]
+fn instances_in_view_draw_when_their_node_is_out_of_it() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        let away = Vec3::new(50.0, 0.0, 0.0);
+        scene
+            .root()
+            .add_child(&instanced_cubes(away, &[Vec3::ZERO, -away]));
+        let pixels = render(gpu, scene);
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
+    });
+}
+
+#[test]
+fn instance_rotations_turn_normals_with_them() {
+    with_gpu(|gpu| {
+        let scene = Scene::new();
+        let plane = Node::new();
+        plane.set_mesh(Some((
+            Geometry::plane(Vec2::splat(4.0)),
+            Material::Standard(StandardMaterial {
+                roughness: 1.0,
+                ..Default::default()
+            }),
+        )));
+        // Stood up to face the camera, and stretched, which a plain model matrix would mis-shade.
+        plane.set_instances(Some(Instances::new(vec![
+            Mat4::from_scale(Vec3::new(1.0, 1.0, 3.0))
+                * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2),
+        ])));
+        let light = Node::new();
+        light.set_light(Some(Light::Directional {
+            color: Color::rgb(255, 255, 255),
+            intensity: 1.0,
+            shadow: None,
+        }));
+        scene.root().add_child(&plane);
+        scene.root().add_child(&light);
+        let lit = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2);
+        assert!(lit[0] >= 235, "{lit:?}");
+    });
+}
+
+#[test]
+fn instances_cast_shadows() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::ZERO);
+        caster.set_instances(Some(Instances::new(vec![Mat4::from_translation(
+            Vec3::Y * 1.5,
+        )])));
+        scene.root().add_child(&sun(Some(SUN_SHADOW)));
+        let pixels = render(gpu, scene);
+        let shadowed = floor_pixel(&pixels, view_proj, -1.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+    });
+}
+
+#[test]
+fn raycasts_report_the_instance_they_hit() {
+    let scene = Scene::new();
+    let right = Vec3::new(1.5, 0.0, 0.0);
+    let cubes = instanced_cubes(Vec3::ZERO, &[-right, right]);
+    scene.root().add_child(&cubes);
+    let hits = scene.raycast(crate::Ray::new(Vec3::new(1.5, 0.0, 5.0), Vec3::NEG_Z));
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.node == cubes && hit.instance == Some(1))
+    );
+    assert!((hits[0].point.x - 1.5).abs() < 1e-4);
+}
+
+#[test]
+fn visible_distance_hides_nodes_by_how_far_the_camera_is() {
+    with_gpu(|gpu| {
+        let scene = post_stage(1.0, PostProcessing::default());
+        let group = Node::new();
+        let mesh = scene.root().children()[0].clone();
+        mesh.remove_from_parent();
+        group.add_child(&mesh);
+        scene.root().add_child(&group);
+        let ray = crate::Ray::new(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z);
+
+        // The default camera is 5 units from the origin.
+        group.set_visible_distance(Some(0.0..4.0));
+        assert_eq!(
+            pixel(&render(gpu, scene.clone()), SIZE / 2, SIZE / 2),
+            [0, 0, 255, 255]
+        );
+        assert!(scene.raycast(ray).is_empty());
+
+        group.set_visible_distance(Some(4.0..6.0));
+        assert_eq!(
+            pixel(&render(gpu, scene.clone()), SIZE / 2, SIZE / 2),
+            [255, 0, 0, 255]
+        );
+        assert!(!scene.raycast(ray).is_empty());
+    });
+}
+
+#[test]
+fn more_point_lights_than_a_uniform_holds_all_light() {
+    with_gpu(|gpu| {
+        let (scene, _, caster, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::ZERO);
+        caster.remove_from_parent();
+        let spots: Vec<(f32, f32)> = (0..8)
+            .flat_map(|i| (0..5).map(move |j| (i as f32 - 3.5, j as f32 - 2.0)))
+            .collect();
+        for &(x, z) in &spots {
+            let light = Node::new();
+            light.set_transform(Transform::from_translation(Vec3::new(x, 0.3, z)));
+            light.set_light(Some(Light::Point {
+                color: Color::rgb(255, 255, 255),
+                intensity: 1.0,
+                range: 0.4,
+                shadow: None,
+            }));
+            scene.root().add_child(&light);
+        }
+        let pixels = render(gpu, scene);
+        for &(x, z) in &spots {
+            let lit = floor_pixel(&pixels, view_proj, x, z);
+            assert!(lit[0] > 100, "{x} {z} {lit:?}");
+        }
+        let between = floor_pixel(&pixels, view_proj, 0.0, 0.5);
+        assert!(between[0] < 20, "{between:?}");
+    });
+}
+
+#[test]
+fn lights_out_of_view_leave_the_shadowing_ones_their_maps() {
+    with_gpu(|gpu| {
+        let (scene, _, _, view_proj) = shadow_stage(Vec3::new(0.0, 6.0, 0.0), 1.2, Vec3::Y * 1.5);
+        for x in [-100.0, 100.0] {
+            let far = Node::new();
+            far.set_transform(Transform::from_translation(Vec3::new(x, 3.0, 0.0)));
+            far.set_light(Some(Light::Point {
+                color: Color::rgb(255, 255, 255),
+                intensity: 10.0,
+                range: 5.0,
+                shadow: Some(Shadow::default()),
+            }));
+            scene.root().add_child(&far);
+        }
+        let light = Node::new();
+        light.set_transform(Transform::from_translation(Vec3::Y * 3.0));
+        light.set_light(Some(Light::Point {
+            color: Color::rgb(255, 255, 255),
+            intensity: 10.0,
+            range: 20.0,
+            shadow: Some(Shadow {
+                map_size: 256,
+                ..Shadow::default()
+            }),
+        }));
+        scene.root().add_child(&light);
+        let pixels = render(gpu, scene);
+        let shadowed = floor_pixel(&pixels, view_proj, 1.2, 0.0);
+        let lit = floor_pixel(&pixels, view_proj, 2.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 150, "lit {lit:?}");
+    });
+}
+
+/// A plane facing up, seen from straight above, lit by a sun at `elevation` radians over the
+/// horizon toward +X.
+fn material_stage(material: StandardMaterial, elevation: f32) -> (Scene, Mat4) {
+    let (scene, floor, caster, view_proj) = shadow_stage(Vec3::new(0.0, 3.0, 0.0), 1.2, Vec3::ZERO);
+    caster.remove_from_parent();
+    floor.set_mesh(Some((
+        Geometry::plane(Vec2::splat(12.0)),
+        Material::Standard(material),
+    )));
+    let light = Node::new();
+    light.set_transform(Transform {
+        rotation: crate::core::rotation_toward(
+            Vec3::new(-elevation.cos(), -elevation.sin(), 0.0),
+            Vec3::Z,
+        ),
+        ..Transform::IDENTITY
+    });
+    light.set_light(Some(Light::Directional {
+        color: Color::rgb(255, 255, 255),
+        intensity: 1.0,
+        shadow: None,
+    }));
+    scene.root().add_child(&light);
+    (scene, view_proj)
+}
+
+const BLACK: Color = Color::rgb(0, 0, 0);
+
+#[test]
+fn a_clearcoat_adds_a_sharp_highlight_over_a_rough_surface() {
+    with_gpu(|gpu| {
+        let center = |clearcoat| {
+            let (scene, _) = material_stage(
+                StandardMaterial {
+                    base_color: BLACK,
+                    roughness: 1.0,
+                    clearcoat,
+                    clearcoat_roughness: 0.1,
+                    ..Default::default()
+                },
+                std::f32::consts::FRAC_PI_2,
+            );
+            pixel(&render(gpu, scene), SIZE / 2, SIZE / 2)[0]
+        };
+        let (plain, coated) = (center(0.0), center(1.0));
+        assert!(coated > plain + 100, "{plain} {coated}");
+    });
+}
+
+#[test]
+fn a_sheen_glows_under_grazing_light() {
+    with_gpu(|gpu| {
+        let center = |sheen_color| {
+            let (scene, _) = material_stage(
+                StandardMaterial {
+                    base_color: BLACK,
+                    roughness: 1.0,
+                    sheen_color,
+                    sheen_roughness: 0.5,
+                    ..Default::default()
+                },
+                0.3,
+            );
+            pixel(&render(gpu, scene), SIZE / 2, SIZE / 2)[0]
+        };
+        let (plain, sheen) = (center(BLACK), center(Color::rgb(255, 255, 255)));
+        assert!(sheen > plain + 30, "{plain} {sheen}");
+    });
+}
+
+/// How many pixels of the row and of the column through the center are lit.
+fn highlight_extent(pixels: &[[u8; 4]]) -> (usize, usize) {
+    let lit = |p: [u8; 4]| p[0] > 60;
+    let row = (0..SIZE)
+        .filter(|&x| lit(pixel(pixels, x, SIZE / 2)))
+        .count();
+    let column = (0..SIZE)
+        .filter(|&y| lit(pixel(pixels, SIZE / 2, y)))
+        .count();
+    (row, column)
+}
+
+#[test]
+fn anisotropy_stretches_highlights_along_one_direction() {
+    with_gpu(|gpu| {
+        let extent = |anisotropy| {
+            let (scene, _) = material_stage(
+                StandardMaterial {
+                    base_color: BLACK,
+                    roughness: 0.4,
+                    anisotropy,
+                    ..Default::default()
+                },
+                std::f32::consts::FRAC_PI_2,
+            );
+            highlight_extent(&render(gpu, scene))
+        };
+        let (row, column) = extent(0.0);
+        assert!(row.abs_diff(column) <= 2, "{row} {column}");
+        let (along, across) = extent(0.9);
+        let (rotated_along, rotated_across) = extent(-0.9);
+        assert!(along.abs_diff(across) > 8, "{along} {across}");
+        assert!(
+            (along > across) != (rotated_along > rotated_across),
+            "{along} {across} {rotated_along} {rotated_across}"
+        );
+    });
+}
+
+/// A red cube behind a pane of `material` facing the default camera, over a blue background.
+fn behind_glass(material: StandardMaterial) -> Scene {
+    let scene = post_stage(1.0, PostProcessing::default());
+    scene.root().children()[0].set_transform(Transform::from_translation(Vec3::NEG_Z * 2.0));
+    let pane = Node::new();
+    pane.set_transform(Transform {
+        translation: Vec3::Z,
+        rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+        ..Transform::IDENTITY
+    });
+    pane.set_mesh(Some((
+        Geometry::plane(Vec2::splat(6.0)),
+        Material::Standard(material),
+    )));
+    scene.root().add_child(&pane);
+    scene
+}
+
+#[test]
+fn transmissive_surfaces_show_the_scene_behind_them() {
+    with_gpu(|gpu| {
+        let opaque = render(gpu, behind_glass(StandardMaterial::default()));
+        assert_eq!(pixel(&opaque, SIZE / 2, SIZE / 2), [0, 0, 0, 255]);
+
+        let glass = StandardMaterial {
+            transmission: 1.0,
+            roughness: 0.0,
+            ior: 1.0,
+            ..Default::default()
+        };
+        let pixels = render(gpu, behind_glass(glass));
+        let through = pixel(&pixels, SIZE / 2, SIZE / 2);
+        assert!(through[0] > 200 && through[2] < 40, "{through:?}");
+        let background = pixel(&pixels, 2, 2);
+        assert!(background[2] > 200 && background[0] < 40, "{background:?}");
+    });
+}
+
+#[test]
+fn transmission_tints_by_the_base_color() {
+    with_gpu(|gpu| {
+        let glass = StandardMaterial {
+            base_color: Color::rgb(0, 255, 0),
+            transmission: 1.0,
+            roughness: 0.0,
+            ior: 1.0,
+            ..Default::default()
+        };
+        let pixels = render(gpu, behind_glass(glass));
+        let background = pixel(&pixels, 2, 2);
+        assert!(background[2] < 40, "{background:?}");
+    });
+}
+
+fn custom_scene(material: CustomMaterial) -> Scene {
+    let scene = Scene::new();
+    let mesh = Node::new();
+    mesh.set_mesh(Some((
+        Geometry::cuboid(Vec3::ONE),
+        Material::Custom(material),
+    )));
+    scene.root().add_child(&mesh);
+    scene
+}
+
+#[test]
+fn a_custom_material_computes_its_surface_in_wgsl() {
+    with_gpu(|gpu| {
+        let shader = MaterialShader::new(
+            "fn surface(input: SurfaceInput) -> Surface {
+                var s = standard_surface(input);
+                s.base_color = vec4(0.0, 0.0, 0.0, 1.0);
+                s.emissive = draw.custom[0].rgb + textureSample(texture0, material_sampler, input.uv).rgb;
+                return s;
+            }",
+        )
+        .unwrap();
+        let mut material = CustomMaterial::new(shader.clone());
+        material.params[0] = glam::Vec4::new(1.0, 0.0, 0.0, 0.0);
+        material.textures = vec![Texture::from_rgba8(1, 1, vec![0, 0, 255, 255])];
+        let pixels = render(gpu, custom_scene(material));
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [255, 0, 255, 255]);
+
+        let mut other = CustomMaterial::new(shader);
+        other.params[0] = glam::Vec4::new(0.0, 1.0, 0.0, 0.0);
+        other.textures = vec![Texture::from_rgba8(1, 1, vec![0, 0, 0, 255])];
+        let pixels = render(gpu, custom_scene(other));
+        assert_eq!(pixel(&pixels, SIZE / 2, SIZE / 2), [0, 255, 0, 255]);
+    });
+}
+
+#[test]
+fn invalid_material_shaders_are_rejected_with_the_reason() {
+    let missing = MaterialShader::new("fn not_surface() {}").unwrap_err();
+    assert!(missing.to_string().contains("surface"), "{missing}");
+    let typo = MaterialShader::new(
+        "fn surface(input: SurfaceInput) -> Surface { return standard_surface(input) }",
+    )
+    .unwrap_err();
+    assert!(!typo.to_string().is_empty());
+}
+
+#[test]
+fn transmission_sees_through_under_post_processing() {
+    with_gpu(|gpu| {
+        let scene = behind_glass(StandardMaterial {
+            transmission: 1.0,
+            roughness: 0.0,
+            ior: 1.0,
+            ..Default::default()
+        });
+        scene.set_post_processing(PostProcessing {
+            fxaa: true,
+            ..Default::default()
+        });
+        let through = pixel(&render(gpu, scene), SIZE / 2, SIZE / 2);
+        assert!(through[0] > 200 && through[2] < 40, "{through:?}");
+    });
+}
+
+/// `shadow_stage` seen from `eye` toward `target` through an orthographic camera `height` tall.
+fn orthographic(scene: &Scene, eye: Vec3, target: Vec3, height: f32) -> Mat4 {
+    let camera = scene.root().children()[0].clone();
+    let projection = Projection::Orthographic {
+        height,
+        near: 0.1,
+        far: 20.0,
+    };
+    let transform = Transform::looking_at(eye, target, Vec3::NEG_Z);
+    camera.set_transform(transform);
+    camera.set_camera(Some(projection));
+    projection.to_matrix(1.0) * transform.to_matrix().inverse()
+}
+
+#[test]
+fn orthographic_cameras_get_sun_shadows_and_ambient_occlusion() {
+    with_gpu(|gpu| {
+        let eye = Vec3::new(0.0, 6.0, 0.0);
+        let (scene, _, _, _) = shadow_stage(eye, 1.2, Vec3::Y * 1.5);
+        let view_proj = orthographic(&scene, eye, Vec3::ZERO, 8.0);
+        scene.root().add_child(&sun(Some(SUN_SHADOW)));
+        let pixels = render(gpu, scene);
+        let shadowed = floor_pixel(&pixels, view_proj, -1.5, 0.0);
+        let lit = floor_pixel(&pixels, view_proj, 1.5, 0.0);
+        assert!(shadowed[0] < 20, "shadowed {shadowed:?}");
+        assert!(lit[0] > 200, "lit {lit:?}");
+
+        let floor_at = |occlusion: Option<AmbientOcclusion>| {
+            let eye = Vec3::new(2.0, 4.0, 0.0);
+            let (scene, _, _, _) = shadow_stage(eye, 1.2, Vec3::Y * 0.5);
+            let view_proj = orthographic(&scene, eye, Vec3::new(0.5, 0.0, 0.0), 4.0);
+            scene.set_ambient_light(Color::rgb(255, 255, 255), 0.5);
+            scene.set_post_processing(PostProcessing {
+                ambient_occlusion: occlusion,
+                ..Default::default()
+            });
+            let pixels = render(gpu, scene);
+            (
+                i32::from(floor_pixel(&pixels, view_proj, 0.6, 0.0)[0]),
+                i32::from(floor_pixel(&pixels, view_proj, 3.0, 2.0)[0]),
+            )
+        };
+        let (near, far) = floor_at(None);
+        let (occluded_near, occluded_far) = floor_at(Some(AmbientOcclusion::default()));
+        assert!(occluded_near + 20 < near, "{near} {occluded_near}");
+        assert!(occluded_far + 3 >= far, "{far} {occluded_far}");
+    });
+}
+
+const HOST_DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+
+fn layer_target(view: Mat4) -> LayerTarget {
+    LayerTarget {
+        view: view.to_cols_array_2d(),
+        projection: Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0).to_cols_array_2d(),
+        frame: FrameInfo {
+            timestamp: Duration::ZERO,
+        },
+        color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        depth_format: HOST_DEPTH,
+        samples: 1,
+        size: (SIZE, SIZE),
+        scale: 1.0,
+    }
+}
+
+/// Draws a blue wall over the host's left half at clip depth `wall`, then `layer`, the way a host
+/// with a stencil depth buffer would, and reads the frame back.
+fn host_frame(
+    gpu: &Gpu,
+    layer: &whisker_wgpu::LayerHandle,
+    target: &LayerTarget,
+    wall: f32,
+) -> Vec<[u8; 4]> {
+    host_pass(gpu, &[layer], target, Some(wall))
+}
+
+/// Prepares every layer, then draws them in order in one pass, as the contract has hosts do.
+fn host_frames(
+    gpu: &Gpu,
+    layers: &[&whisker_wgpu::LayerHandle],
+    target: &LayerTarget,
+) -> Vec<[u8; 4]> {
+    host_pass(gpu, layers, target, None)
+}
+
+fn host_pass(
+    gpu: &Gpu,
+    layers: &[&whisker_wgpu::LayerHandle],
+    target: &LayerTarget,
+    wall: Option<f32>,
+) -> Vec<[u8; 4]> {
+    let texture = |format, usage| {
+        gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | usage,
+            view_formats: &[],
+        })
+    };
+    let color = texture(target.color_format, wgpu::TextureUsages::COPY_SRC);
+    let depth = texture(HOST_DEPTH, wgpu::TextureUsages::empty());
+    let module = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+                        let x = f32(i & 1u); let y = f32((i >> 1u) & 1u);
+                        return vec4(x - 1.0, y * 2.0 - 1.0, {:?}, 1.0);
+                    }}
+                    @fragment fn fs() -> @location(0) vec4<f32> {{ return vec4(0.0, 0.0, 1.0, 1.0); }}",
+                    wall.unwrap_or(0.5)
+                )
+                .into(),
+            ),
+        });
+    let wall_pipeline = gpu
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(target.color_format.into())],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: HOST_DEPTH,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    for layer in layers {
+        layer.borrow_mut().prepare(gpu, &mut encoder, target);
+    }
+    {
+        let color_view = color.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+            }),
+            ..Default::default()
+        });
+        if wall.is_some() {
+            pass.set_pipeline(&wall_pipeline);
+            pass.draw(0..4, 0..1);
+        }
+        for layer in layers {
+            layer.borrow_mut().draw(gpu, &mut pass, target);
+        }
+    }
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(SIZE * SIZE * 4),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        color.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SIZE * 4),
+                rows_per_image: Some(SIZE),
+            },
+        },
+        color.size(),
+    );
+    gpu.queue.submit([encoder.finish()]);
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |result| result.unwrap());
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    bytemuck::cast_slice(&buffer.slice(..).get_mapped_range().unwrap()).to_vec()
+}
+
+/// A red unlit cube of side `size` at the origin, with a camera node the layer must ignore.
+fn cube_scene(size: f32) -> Scene {
+    let scene = Scene::new();
+    let mesh = Node::new();
+    mesh.set_mesh(Some((
+        Geometry::cuboid(Vec3::splat(size)),
+        Material::Unlit {
+            color: Color::rgb(255, 0, 0),
+        },
+    )));
+    scene.root().add_child(&mesh);
+    let camera = Node::new();
+    camera.set_camera(Some(Projection::Perspective {
+        fov_y: 1.0,
+        near: 0.1,
+        far: 100.0,
+    }));
+    camera.set_transform(Transform::looking_at(
+        Vec3::new(0.0, 50.0, 0.0),
+        Vec3::ZERO,
+        Vec3::Z,
+    ));
+    scene.root().add_child(&camera);
+    scene
+}
+
+fn front_view() -> Mat4 {
+    Mat4::look_at_rh(Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, Vec3::Y)
+}
+
+#[test]
+fn a_layer_draws_into_the_host_pass_against_the_host_depth() {
+    with_gpu(|gpu| {
+        let layer = cube_scene(2.0).layer();
+        let target = layer_target(front_view());
+        let near = host_frame(gpu, &layer, &target, 0.01);
+        let left = SIZE / 2 - 4;
+        let right = SIZE / 2 + 4;
+        let middle = SIZE / 2;
+        assert_eq!(
+            pixel(&near, left, middle),
+            [0, 0, 255, 255],
+            "the nearer wall hides the cube"
+        );
+        assert_eq!(
+            pixel(&near, right, middle),
+            [255, 0, 0, 255],
+            "the cube shows past the wall"
+        );
+        assert_eq!(
+            pixel(&near, SIZE - 1, 0),
+            [0, 0, 0, 255],
+            "the layer leaves the rest alone"
+        );
+        let far = host_frame(gpu, &layer, &target, 0.9999);
+        assert_eq!(
+            pixel(&far, left, middle),
+            [255, 0, 0, 255],
+            "the cube hides the farther wall"
+        );
+        assert_eq!(pixel(&far, 0, middle), [0, 0, 255, 255]);
+    });
+}
+
+#[test]
+fn a_view_with_a_uniform_scale_draws_like_the_scene_scaled_up() {
+    with_gpu(|gpu| {
+        let scaled = cube_scene(0.02).layer();
+        let target = layer_target(front_view() * Mat4::from_scale(Vec3::splat(100.0)));
+        let small = host_frame(gpu, &scaled, &target, 0.9999);
+        let unscaled = cube_scene(2.0).layer();
+        let large = host_frame(gpu, &unscaled, &layer_target(front_view()), 0.9999);
+        assert_eq!(small, large);
+    });
+}
+
+#[test]
+fn a_layer_tap_reaches_the_hit_node_and_reports_whether_one_took_it() {
+    let scene = cube_scene(2.0);
+    let tapped = Rc::new(std::cell::Cell::new(false));
+    let seen = tapped.clone();
+    scene.root().children()[0].set_on_tap(Some(Rc::new(move |_| seen.set(true))));
+    let layer = scene.layer();
+    let target = layer_target(front_view());
+    let center = [SIZE as f32 / 2.0, SIZE as f32 / 2.0];
+    assert!(!layer.borrow_mut().tap([1.0, 1.0], &target));
+    assert!(!tapped.get());
+    assert!(layer.borrow_mut().tap(center, &target));
+    assert!(tapped.get());
+}
+
+/// A white ground 4 wide centered at `x`, lit by a sun slanting toward -X, with a cube one unit
+/// above `caster` when given.
+fn shadowed_ground(x: f32, caster: Option<f32>) -> Scene {
+    let scene = Scene::new();
+    scene.set_ambient_light(Color::rgb(255, 255, 255), 0.1);
+    let add = |geometry: Geometry, at: Vec3| {
+        let node = Node::new();
+        node.set_mesh(Some((
+            geometry,
+            Material::Standard(StandardMaterial {
+                base_color: Color::rgb(255, 255, 255),
+                roughness: 1.0,
+                ..Default::default()
+            }),
+        )));
+        node.set_transform(Transform::from_translation(at));
+        scene.root().add_child(&node);
+    };
+    add(Geometry::plane(Vec2::splat(4.0)), Vec3::new(x, 0.0, 0.0));
+    if let Some(caster) = caster {
+        add(
+            Geometry::cuboid(Vec3::splat(0.5)),
+            Vec3::new(caster, 1.0, 0.0),
+        );
+    }
+    let sun = Node::new();
+    sun.set_light(Some(Light::Directional {
+        color: Color::rgb(255, 255, 255),
+        intensity: 0.5,
+        shadow: Some(Shadow {
+            map_size: 1024,
+            cascades: 1,
+            distance: 50.0,
+            ..Default::default()
+        }),
+    }));
+    sun.set_transform(Transform::looking_at(
+        Vec3::ZERO,
+        Vec3::new(-1.0, -1.0, 0.0),
+        Vec3::Y,
+    ));
+    scene.root().add_child(&sun);
+    scene
+}
+
+#[test]
+fn layers_drawn_in_one_pass_each_keep_their_own_shadows() {
+    with_gpu(|gpu| {
+        let left = shadowed_ground(-2.0, Some(-1.0)).layer();
+        let right = shadowed_ground(2.0, None).layer();
+        let mut target = layer_target(Mat4::look_at_rh(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::ZERO,
+            Vec3::NEG_Z,
+        ));
+        // A far plane just past the ground, as a map's is when looking straight down.
+        target.projection = Mat4::perspective_rh(1.0, 1.0, 0.1, 10.5).to_cols_array_2d();
+        let pixels = host_frames(gpu, &[&left, &right], &target);
+        let column = |x: f32| ((x / (10.0 * 0.5f32.tan()) + 1.0) / 2.0 * SIZE as f32) as u32;
+        let shadowed = pixel(&pixels, column(-2.0), SIZE / 2);
+        let lit = pixel(&pixels, column(-3.6), SIZE / 2);
+        assert!(
+            u32::from(shadowed[0]) + 60 < u32::from(lit[0]),
+            "shadowed {shadowed:?}, lit {lit:?}"
+        );
     });
 }

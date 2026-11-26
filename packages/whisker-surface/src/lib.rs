@@ -25,7 +25,6 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use whisker::prelude::*;
 use whisker::runtime::view::Element;
 use whisker::runtime::{WeakRuntimeContext, current_runtime_context};
 use whisker::{RwSignal, Signal, Style};
@@ -207,10 +206,10 @@ fn prop_value(id: u64, wakes: u64) -> String {
 /// Shows a [`Surface`] in the element's box.
 #[whisker::component]
 pub fn surface_view(surface: Surface, style: Style) -> Element {
-    let prop = surface.inner.prop;
-    render! {
-        SurfaceElement(surface: prop, style: style.clone())
-    }
+    SurfaceElement::builder()
+        .surface(surface.inner.prop)
+        .style(style.clone())
+        .build()
 }
 
 #[doc(hidden)]

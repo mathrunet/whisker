@@ -1,6 +1,6 @@
 [package]
 name = "whisker-scene"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,12 +12,16 @@ categories.workspace = true
 description = "A 3D scene graph for Whisker, written as components and drawn with wgpu."
 
 [dependencies]
-whisker = { workspace = true }
-whisker-surface = { path = "../whisker-surface", version = "0.1.0" }
-whisker-wgpu = { path = "../whisker-wgpu", version = "0.1.0" }
+whisker = { path = "../../crates/whisker", version = "0.19.2" }
+whisker-surface = { path = "../whisker-surface", version = "0.1.1" }
+whisker-wgpu = { path = "../whisker-wgpu", version = "0.1.1" }
 glam = "0.30"
 bytemuck = { version = "1.25", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr"] }
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "KHR_lights_punctual", "KHR_materials_emissive_strength", "KHR_materials_ior", "KHR_materials_transmission", "KHR_materials_volume", "KHR_materials_unlit", "KHR_texture_transform"] }
+base64 = "0.22"
+naga = { version = "30", features = ["wgsl-in"] }
 
 [dev-dependencies]
 pollster = "0.4"
+serde_json = "1"

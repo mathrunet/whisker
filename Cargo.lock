@@ -1010,6 +1010,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "earcutr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79127ed59a85d7687c409e9978547cffb7dc79675355ed22da6b66fd5f6ead01"
+dependencies = [
+ "itertools 0.11.0",
+ "num-traits",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1588,6 +1598,42 @@ dependencies = [
  "slotmap",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "gltf"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3ce1918195723ce6ac74e80542c5a96a40c2b26162c1957a5cd70799b8cacf7"
+dependencies = [
+ "byteorder",
+ "gltf-json",
+ "lazy_static",
+ "serde_json",
+]
+
+[[package]]
+name = "gltf-derive"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14070e711538afba5d6c807edb74bcb84e5dbb9211a3bf5dea0dfab5b24f4c51"
+dependencies = [
+ "inflections",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "gltf-json"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6176f9d60a7eab0a877e8e96548605dedbde9190a7ae1e80bbcc1c9af03ab14"
+dependencies = [
+ "gltf-derive",
+ "serde",
+ "serde_derive",
+ "serde_json",
 ]
 
 [[package]]
@@ -2218,6 +2264,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "inflections"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
+
+[[package]]
 name = "inotify"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2314,6 +2366,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -5480,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "whisker"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5499,7 +5560,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-animation"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker-css",
  "whisker-runtime",
@@ -5559,7 +5620,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-build"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "indicatif",
@@ -5599,7 +5660,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-cli"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5626,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-cng"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -5641,8 +5702,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "whisker-commitcity"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "whisker",
+ "whisker-cng",
+ "whisker-input",
+ "whisker-safe-area",
+ "whisker-scene",
+ "whisker-surface",
+]
+
+[[package]]
 name = "whisker-config"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -5652,7 +5731,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-credentials"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "age",
  "anyhow",
@@ -5663,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-css"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker-macros",
  "whisker-style",
@@ -5671,7 +5750,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-dev-protocol"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "hmac 0.12.1",
  "serde",
@@ -5682,7 +5761,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-dev-runtime"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "futures-util",
  "libc",
@@ -5699,7 +5778,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-dev-server"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "ar",
@@ -5728,7 +5807,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-driver"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker-dev-runtime",
  "whisker-driver-sys",
@@ -5738,14 +5817,14 @@ dependencies = [
 
 [[package]]
 name = "whisker-driver-sys"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "whisker-engine"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker-layout",
  "whisker-protocol",
@@ -5854,7 +5933,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-fmt"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -6005,7 +6084,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-layout"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "taffy",
  "whisker-protocol",
@@ -6014,7 +6093,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-linux"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "csscolorparser",
  "gtk4",
@@ -6053,7 +6132,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-macro-syntax"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
@@ -6061,7 +6140,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-macros"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6069,6 +6148,40 @@ dependencies = [
  "serde_json",
  "syn 2.0.119",
  "whisker-macro-syntax",
+]
+
+[[package]]
+name = "whisker-map"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "earcutr",
+ "flate2",
+ "glam",
+ "image",
+ "js-sys",
+ "pollster",
+ "serde_json",
+ "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "whisker",
+ "whisker-style",
+ "whisker-surface",
+ "whisker-wgpu",
+]
+
+[[package]]
+name = "whisker-map-example"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "whisker",
+ "whisker-cng",
+ "whisker-map",
+ "whisker-safe-area",
 ]
 
 [[package]]
@@ -6104,7 +6217,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-plugin"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -6113,7 +6226,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-protocol"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker-value",
 ]
@@ -6155,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-runtime"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "futures-channel",
  "futures-executor",
@@ -6178,12 +6291,16 @@ dependencies = [
 
 [[package]]
 name = "whisker-scene"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "bytemuck",
  "glam",
+ "gltf",
  "image",
+ "naga",
  "pollster",
+ "serde_json",
  "whisker",
  "whisker-surface",
  "whisker-wgpu",
@@ -6236,11 +6353,11 @@ dependencies = [
 
 [[package]]
 name = "whisker-style"
-version = "0.19.1"
+version = "0.19.2"
 
 [[package]]
 name = "whisker-submit"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6275,15 +6392,16 @@ dependencies = [
 
 [[package]]
 name = "whisker-surface"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "serde",
  "web-sys",
  "whisker",
 ]
 
 [[package]]
 name = "whisker-surface-linux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "whisker",
  "whisker-linux",
@@ -6292,7 +6410,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-surface-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "web-sys",
  "whisker-surface",
@@ -6339,7 +6457,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-value"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -6363,7 +6481,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-web"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "base64 0.22.1",
  "js-sys",
@@ -6428,7 +6546,7 @@ dependencies = [
 
 [[package]]
 name = "whisker-wgpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ash",
  "pollster",
@@ -6451,14 +6569,14 @@ dependencies = [
 
 [[package]]
 name = "whisker-windows"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "whisker",
 ]
 
 [[package]]
 name = "whisker-windows-host-conformance"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "base64 0.22.1",
  "csscolorparser",

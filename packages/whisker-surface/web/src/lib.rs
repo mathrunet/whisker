@@ -135,7 +135,7 @@ impl WhiskerModule for SurfaceModule {
             .view(
                 WebViewDefinition::new(
                     "whisker-surface:Surface",
-                    |document, _emitter| SurfaceCanvas::new(document),
+                    |document, _| SurfaceCanvas::new(document),
                     |view| view.0.borrow().canvas.clone().into(),
                 )
                 .prop(
