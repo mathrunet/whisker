@@ -70,6 +70,9 @@ internal fun applyBoxPaint(
         borderStyles.all { it == BORDER_STYLE_SOLID } &&
         borderWidths.all { it == borderWidths[0] } &&
         borderColors.all { it == borderColors[0] }
+    (node as? rs.whisker.runtime.scene.HostNode)?.paintsBox = backgroundLayers != null ||
+        Color.alpha(background) != 0 ||
+        borderWidths.indices.any { borderWidths[it] > 0f && Color.alpha(borderColors[it]) != 0 }
     node.background = if (uniformSolidBorder) {
         GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE

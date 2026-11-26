@@ -410,7 +410,7 @@ internal class HostScene(
                 requireNotNull(operation.numbers),
                 root.resources.displayMetrics.density,
             )
-            OP_OPACITY -> (nodes[id] ?: return).alpha = operation.scalar
+            OP_OPACITY -> (nodes[id] ?: return).setOpacity(operation.scalar)
             OP_VISIBILITY -> (nodes[id] ?: return).setWhiskerVisibility(operation.integer != 0)
             OP_Z_ORDER -> (nodes[id] ?: return).zOrder = operation.integer
             OP_TEXT -> applyText(

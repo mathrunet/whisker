@@ -67,12 +67,19 @@ internal class HostNode(
     var paint: HostBoxPaint? = null
     var backgroundLayers: HostBackgroundLayers? = null
     var boxShadows: List<HostBoxShadow> = emptyList()
+
+    /** False when the applied box paint has no visible background, border, or image layer. */
+    var paintsBox: Boolean = true
     var clipPath: HostClipPath? = null
     var mountedElement: WhiskerMountedElement? = null
     var zOrder: Int = 0
     var imageRendering: HostImageRendering = HostImageRendering.Auto
     var backdropBlur: Float = 0f
         set(value) {
+            if (value == field) return
+            if (value <= 0f) {
+                backdropRenderer = null
+            }
             field = value
             updateBackdropRegistration()
             invalidate()
@@ -95,6 +102,8 @@ internal class HostNode(
     private var paintClipPath: Path? = null
     private var resolvedBoxGeometry: ResolvedBoxGeometry? = null
     private var backdropRenderer: HostBackdropBlurRenderer? = null
+    private val backdropClip = Path()
+    private var backdropClipGeometry: ResolvedBoxGeometry? = null
     private var whiskerVisible = true
 
     init {
@@ -296,8 +305,40 @@ internal class HostNode(
     fun setLayoutPosition(x: Float, y: Float) {
         layoutTranslationX = x
         layoutTranslationY = y
-        translationX = x + nativeTransformTranslationX
-        translationY = y + nativeTransformTranslationY
+        val marked = root?.beginBackdropPropertyChange(this, BackdropChange.Transform) == true
+        try {
+            translationX = x + nativeTransformTranslationX
+            translationY = y + nativeTransformTranslationY
+            // The blur bakes this node's offset from the root into its own recording.
+            if (backdropBlur > 0f) repositionBackdrop()
+        } finally {
+            if (marked) root?.endBackdropPropertyChange()
+        }
+    }
+
+    /** Sets this node's opacity, which never changes what a backdrop below it records. */
+    fun setOpacity(value: Float) {
+        if (alpha == value) return
+        val marked = root?.beginBackdropPropertyChange(this, BackdropChange.Opacity) == true
+        try {
+            alpha = value
+        } finally {
+            if (marked) root?.endBackdropPropertyChange()
+        }
+    }
+
+    /**
+     * True when this node paints anything of its own, or any child, before [child]. A backdrop
+     * capture replays that content inline, so moving this node changes the recorded pixels.
+     */
+    fun paintsBeforeChild(child: View): Boolean {
+        if (paintsBox || boxShadows.isNotEmpty()) return true
+        for (index in 0 until childCount) {
+            val earlier = getChildAt(index)
+            if (earlier === child) return false
+            if (earlier.visibility == VISIBLE) return true
+        }
+        return true
     }
 
     /** Applies a protocol transform around the local border-box origin. */
@@ -305,7 +346,8 @@ internal class HostNode(
     fun setLocalTransform(values: FloatArray, density: Float) {
         require(isProjectableFlatPlaneTransform(values))
         require(density.isFinite() && density > 0f)
-        (parent as? android.view.View)?.invalidate()
+        val drewWithCanvasTransform = drawsWithCanvasTransform()
+        if (drewWithCanvasTransform) (parent as? android.view.View)?.invalidate()
         localTransform.setValues(
             floatArrayOf(
                 values[0], values[4], values[12] * density,
@@ -315,6 +357,25 @@ internal class HostNode(
         )
         val isAxisAligned = values[1] == 0f && values[4] == 0f && values[3] == 0f &&
             values[7] == 0f && values[15] == 1f
+        // A pure translation keeps every backdrop recording below this node valid in root space.
+        // Scale is left to a full re-record, as the blur's offset math does not account for it.
+        val translationOnly = isAxisAligned && values[0] == 1f && values[5] == 1f &&
+            scaleX == 1f && scaleY == 1f && !drewWithCanvasTransform
+        val marked = translationOnly &&
+            root?.beginBackdropPropertyChange(this, BackdropChange.Transform) == true
+        try {
+            applyLocalTransform(values, density, isAxisAligned, drewWithCanvasTransform)
+        } finally {
+            if (marked) root?.endBackdropPropertyChange()
+        }
+    }
+
+    private fun applyLocalTransform(
+        values: FloatArray,
+        density: Float,
+        isAxisAligned: Boolean,
+        drewWithCanvasTransform: Boolean,
+    ) {
         if (isAxisAligned) {
             clearNativeTransform()
             pivotX = 0f
@@ -339,9 +400,20 @@ internal class HostNode(
             needsCanvasTransformFallback = !applyNativeTransform(localTransform)
             needsSoftwareCanvasTransform = !needsCanvasTransformFallback
         }
-        invalidate()
-        (parent as? android.view.View)?.invalidate()
+        // View properties and the RenderNode animation matrix invalidate on their own without
+        // re-recording any display list. Re-recording here every animated frame would also make
+        // every backdrop blur painted after this node capture again.
+        if (drewWithCanvasTransform || drawsWithCanvasTransform()) {
+            invalidate()
+            (parent as? android.view.View)?.invalidate()
+        } else if (backdropBlur > 0f) {
+            // The blur bakes this node's offset from the root into its own recording.
+            repositionBackdrop()
+        }
     }
+
+    private fun drawsWithCanvasTransform(): Boolean =
+        needsCanvasTransformFallback || (needsSoftwareCanvasTransform && !isHardwareAccelerated)
 
     @SuppressLint("NewApi")
     private fun applyNativeTransform(matrix: Matrix): Boolean {
@@ -419,11 +491,30 @@ internal class HostNode(
 
     override fun onDetachedFromWindow() {
         root?.updateBackdropNode(this, active = false)
+        backdropRenderer = null
         super.onDetachedFromWindow()
     }
 
+    internal fun invalidateBackdropCapture() {
+        backdropRenderer?.invalidateCapture()
+        invalidate()
+    }
+
+    /** Redraws at a new offset into the existing recording, which a move does not change. */
+    internal fun repositionBackdrop() {
+        backdropRenderer?.notePositionChanged()
+        invalidate()
+    }
+
     private fun updateBackdropRegistration() {
-        root?.updateBackdropNode(this, active = backdropBlur > 0f && isAttachedToWindow)
+        val captureRoot = root ?: return
+        // A blur below a native scroll container is never drawn (see drawBackdropBlur), so it
+        // must not make every scrolled frame invalidate it. Re-parenting detaches and re-attaches
+        // the node, which re-evaluates this.
+        captureRoot.updateBackdropNode(
+            this,
+            active = backdropBlur > 0f && isAttachedToWindow && captureRoot.canRecordBackdrop(this),
+        )
     }
 
     private fun drawBackdropBlur(canvas: Canvas) {
@@ -435,13 +526,21 @@ internal class HostNode(
             return
         }
         val geometry = resolvedBoxGeometry ?: return
-        val clip = Path().apply {
-            addRoundRect(
-                RectF(0f, 0f, geometry.width, geometry.height),
+        // Each layout pass assigns a new geometry instance, so identity is enough to reuse the
+        // clip across the redraws a moving backdrop causes.
+        if (geometry !== backdropClipGeometry) {
+            backdropClip.rewind()
+            backdropClip.addRoundRect(
+                0f,
+                0f,
+                geometry.width,
+                geometry.height,
                 geometry.cornerRadii,
                 Path.Direction.CW,
             )
+            backdropClipGeometry = geometry
         }
+        val clip = backdropClip
         val renderer = backdropRenderer ?: HostBackdropBlurRenderer().also {
             backdropRenderer = it
         }
