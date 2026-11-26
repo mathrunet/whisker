@@ -276,6 +276,11 @@ impl SurfaceEngine {
         self.scene.has_pending_work()
     }
 
+    /// Returns whether a held-back property must still be sent on a later frame.
+    pub fn has_deferred_presentation(&self) -> bool {
+        self.scene.has_deferred_presentation()
+    }
+
     /// Returns a retained scene node when it is live.
     pub fn node(&self, node: NodeId) -> Option<&SceneNode> {
         self.scene.node(node)
@@ -345,6 +350,11 @@ impl SurfaceEngine {
     /// Returns the node currently retaining one pointer capture.
     pub fn pointer_capture_target(&self, pointer: PointerId) -> Option<NodeId> {
         self.scene.pointer_capture_target(pointer)
+    }
+
+    /// Returns whether any pointer capture is retained.
+    pub fn has_pointer_captures(&self) -> bool {
+        self.scene.has_pointer_captures()
     }
 
     /// Replaces one node's event subscription mask.

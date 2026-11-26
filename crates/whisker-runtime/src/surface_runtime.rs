@@ -472,6 +472,11 @@ impl SurfaceRuntime {
         self.state.borrow().surface.scene().accepted_revision()
     }
 
+    /// Returns whether the scene held back a sub-pixel change it must still send exactly.
+    pub fn has_deferred_presentation(&self) -> bool {
+        self.state.borrow().surface.has_deferred_presentation()
+    }
+
     /// Returns the element contracts negotiated by this surface runtime.
     ///
     /// A Host binds this snapshot before accepting the first frame. Built-in
@@ -600,8 +605,15 @@ impl SurfaceRuntime {
 
     /// Forgets every pointer that is down. Hosts end no pointer stream when
     /// the surface stops receiving input, so the owner calls this instead.
+    ///
+    /// Does nothing (and does not wake the runtime) when no pointer is down or
+    /// captured: background drives call this every time, and an unconditional
+    /// wake would schedule the next background drive forever.
     pub(crate) fn clear_active_pointers(&self) {
         let mut state = self.state.borrow_mut();
+        if state.active_pointers.is_empty() && !state.surface.has_pointer_captures() {
+            return;
+        }
         state.active_pointers.clear();
         let result = state
             .surface
